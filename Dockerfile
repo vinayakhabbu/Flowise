@@ -26,7 +26,7 @@ COPY . .
 # RUN pnpm install
 
 # RUN pnpm build
-# Enable corepack and install dependencies
+# Enable corepack and install dependencies. this is important
 RUN corepack enable && pnpm install && pnpm build
 
 EXPOSE 3000
