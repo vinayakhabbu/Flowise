@@ -23,9 +23,11 @@ WORKDIR /usr/src
 # Copy app source
 COPY . .
 
-RUN pnpm install
+# RUN pnpm install
 
-RUN pnpm build
+# RUN pnpm build
+# Enable corepack and install dependencies
+RUN corepack enable && pnpm install && pnpm build
 
 EXPOSE 3000
 
