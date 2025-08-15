@@ -14,15 +14,19 @@ import PerfectScrollbar from 'react-perfect-scrollbar'
 import MainCard from '@/ui-component/cards/MainCard'
 import Transitions from '@/ui-component/extended/Transitions'
 import settings from '@/menu-items/settings'
+import agentsettings from '@/menu-items/agentsettings'
+import customAssistantSettings from '@/menu-items/customassistant'
+import { useAuth } from '@/hooks/useAuth'
 
 // ==============================|| SETTINGS ||============================== //
 
-const Settings = ({ chatflow, isSettingsOpen, anchorEl, onSettingsItemClick, onUploadFile, onClose }) => {
+const Settings = ({ chatflow, isSettingsOpen, isCustomAssistant, anchorEl, isAgentCanvas, onSettingsItemClick, onUploadFile, onClose }) => {
     const theme = useTheme()
     const [settingsMenu, setSettingsMenu] = useState([])
     const customization = useSelector((state) => state.customization)
     const inputFile = useRef(null)
     const [open, setOpen] = useState(false)
+    const { hasPermission } = useAuth()
 
     const handleFileUpload = (e) => {
         if (!e.target.files) return
@@ -42,13 +46,19 @@ const Settings = ({ chatflow, isSettingsOpen, anchorEl, onSettingsItemClick, onU
 
     useEffect(() => {
         if (chatflow && !chatflow.id) {
-            const settingsMenu = settings.children.filter((menu) => menu.id === 'loadChatflow')
+            const menus = isAgentCanvas ? agentsettings : settings
+            const settingsMenu = menus.children.filter((menu) => menu.id === 'loadChatflow')
             setSettingsMenu(settingsMenu)
         } else if (chatflow && chatflow.id) {
-            const settingsMenu = settings.children
-            setSettingsMenu(settingsMenu)
+            if (isCustomAssistant) {
+                const menus = customAssistantSettings
+                setSettingsMenu(menus.children)
+            } else {
+                const menus = isAgentCanvas ? agentsettings : settings
+                setSettingsMenu(menus.children)
+            }
         }
-    }, [chatflow])
+    }, [chatflow, isAgentCanvas, isCustomAssistant])
 
     useEffect(() => {
         setOpen(isSettingsOpen)
@@ -56,6 +66,9 @@ const Settings = ({ chatflow, isSettingsOpen, anchorEl, onSettingsItemClick, onU
 
     // settings list items
     const items = settingsMenu.map((menu) => {
+        if (menu.permission && !hasPermission(menu.permission)) {
+            return null
+        }
         const Icon = menu.icon
         const itemIcon = menu?.icon ? (
             <Icon stroke={1.5} size='1.3rem' />
@@ -144,10 +157,12 @@ const Settings = ({ chatflow, isSettingsOpen, anchorEl, onSettingsItemClick, onU
 Settings.propTypes = {
     chatflow: PropTypes.object,
     isSettingsOpen: PropTypes.bool,
+    isCustomAssistant: PropTypes.bool,
     anchorEl: PropTypes.any,
     onSettingsItemClick: PropTypes.func,
     onUploadFile: PropTypes.func,
-    onClose: PropTypes.func
+    onClose: PropTypes.func,
+    isAgentCanvas: PropTypes.bool
 }
 
 export default Settings

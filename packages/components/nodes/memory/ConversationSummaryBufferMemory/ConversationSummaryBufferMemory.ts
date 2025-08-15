@@ -10,9 +10,10 @@ import {
 } from '../../../src/Interface'
 import { getBaseClasses, mapChatMessageToBaseMessage } from '../../../src/utils'
 import { BaseLanguageModel } from '@langchain/core/language_models/base'
-import { BaseMessage, getBufferString } from '@langchain/core/messages'
+import { BaseMessage, getBufferString, HumanMessage } from '@langchain/core/messages'
 import { ConversationSummaryBufferMemory, ConversationSummaryBufferMemoryInput } from 'langchain/memory'
 import { DataSource } from 'typeorm'
+import { ChatAnthropic } from '../../chatmodels/ChatAnthropic/FlowiseChatAnthropic'
 
 class ConversationSummaryBufferMemory_Memory implements INode {
     label: string
@@ -77,6 +78,7 @@ class ConversationSummaryBufferMemory_Memory implements INode {
         const appDataSource = options.appDataSource as DataSource
         const databaseEntities = options.databaseEntities as IDatabaseEntity
         const chatflowid = options.chatflowid as string
+        const orgId = options.orgId as string
 
         const obj: ConversationSummaryBufferMemoryInput & BufferMemoryExtendedInput = {
             llm: model,
@@ -86,7 +88,8 @@ class ConversationSummaryBufferMemory_Memory implements INode {
             returnMessages: true,
             appDataSource,
             databaseEntities,
-            chatflowid
+            chatflowid,
+            orgId
         }
 
         return new ConversationSummaryBufferMemoryExtended(obj)
@@ -98,12 +101,14 @@ interface BufferMemoryExtendedInput {
     appDataSource: DataSource
     databaseEntities: IDatabaseEntity
     chatflowid: string
+    orgId: string
 }
 
 class ConversationSummaryBufferMemoryExtended extends FlowiseSummaryBufferMemory implements MemoryMethods {
     appDataSource: DataSource
     databaseEntities: IDatabaseEntity
     chatflowid: string
+    orgId: string
     sessionId = ''
 
     constructor(fields: ConversationSummaryBufferMemoryInput & BufferMemoryExtendedInput) {
@@ -112,9 +117,14 @@ class ConversationSummaryBufferMemoryExtended extends FlowiseSummaryBufferMemory
         this.appDataSource = fields.appDataSource
         this.databaseEntities = fields.databaseEntities
         this.chatflowid = fields.chatflowid
+        this.orgId = fields.orgId
     }
 
-    async getChatMessages(overrideSessionId = '', returnBaseMessages = false): Promise<IMessage[] | BaseMessage[]> {
+    async getChatMessages(
+        overrideSessionId = '',
+        returnBaseMessages = false,
+        prependMessages?: IMessage[]
+    ): Promise<IMessage[] | BaseMessage[]> {
         const id = overrideSessionId ? overrideSessionId : this.sessionId
         if (!id) return []
 
@@ -128,7 +138,11 @@ class ConversationSummaryBufferMemoryExtended extends FlowiseSummaryBufferMemory
             }
         })
 
-        let baseMessages = mapChatMessageToBaseMessage(chatMessage)
+        if (prependMessages?.length) {
+            chatMessage.unshift(...prependMessages)
+        }
+
+        let baseMessages = await mapChatMessageToBaseMessage(chatMessage, this.orgId)
 
         // Prune baseMessages if it exceeds max token limit
         if (this.movingSummaryBuffer) {
@@ -155,7 +169,12 @@ class ConversationSummaryBufferMemoryExtended extends FlowiseSummaryBufferMemory
         // ----------- Finished Pruning ---------------
 
         if (this.movingSummaryBuffer) {
-            baseMessages = [new this.summaryChatMessageClass(this.movingSummaryBuffer), ...baseMessages]
+            // Anthropic doesn't support multiple system messages
+            if (this.llm instanceof ChatAnthropic) {
+                baseMessages = [new HumanMessage(`Below is the summarized conversation:\n\n${this.movingSummaryBuffer}`), ...baseMessages]
+            } else {
+                baseMessages = [new this.summaryChatMessageClass(this.movingSummaryBuffer), ...baseMessages]
+            }
         }
 
         if (returnBaseMessages) {

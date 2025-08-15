@@ -15,6 +15,7 @@ class BabyAGI_Agents implements INode {
     category: string
     baseClasses: string[]
     inputs: INodeParams[]
+    badge: string
 
     constructor() {
         this.label = 'BabyAGI'
@@ -23,6 +24,7 @@ class BabyAGI_Agents implements INode {
         this.type = 'BabyAGI'
         this.category = 'Agents'
         this.icon = 'babyagi.svg'
+        this.badge = 'DEPRECATING'
         this.description = 'Task Driven Autonomous Agent which creates new task and reprioritizes task list based on objective'
         this.baseClasses = ['BabyAGI']
         this.inputs = [
@@ -73,7 +75,9 @@ class BabyAGI_Agents implements INode {
                 input = await checkInputs(moderations, input)
             } catch (e) {
                 await new Promise((resolve) => setTimeout(resolve, 500))
-                //streamResponse(options.socketIO && options.socketIOClientId, e.message, options.socketIO, options.socketIOClientId)
+                // if (options.shouldStreamResponse) {
+                //     streamResponse(options.sseStreamer, options.chatId, e.message)
+                // }
                 return formatResponse(e.message)
             }
         }

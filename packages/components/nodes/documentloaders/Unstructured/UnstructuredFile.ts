@@ -1,12 +1,18 @@
-import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
+import { omit } from 'lodash'
+import { ICommonObject, IDocument, INode, INodeData, INodeParams } from '../../../src/Interface'
 import {
-    UnstructuredLoader,
     UnstructuredLoaderOptions,
     UnstructuredLoaderStrategy,
     SkipInferTableTypes,
-    HiResModelName
-} from 'langchain/document_loaders/fs/unstructured'
-import { getCredentialData, getCredentialParam } from '../../../src/utils'
+    HiResModelName,
+    UnstructuredLoader as LCUnstructuredLoader
+} from '@langchain/community/document_loaders/fs/unstructured'
+import { getCredentialData, getCredentialParam, handleEscapeCharacters } from '../../../src/utils'
+import { getFileFromStorage, INodeOutputsValue } from '../../../src'
+import { UnstructuredLoader } from './Unstructured'
+import { isPathTraversal } from '../../../src/validator'
+import sanitize from 'sanitize-filename'
+import path from 'path'
 
 class UnstructuredFile_DocumentLoaders implements INode {
     label: string
@@ -19,11 +25,12 @@ class UnstructuredFile_DocumentLoaders implements INode {
     baseClasses: string[]
     credential: INodeParams
     inputs: INodeParams[]
+    outputs: INodeOutputsValue[]
 
     constructor() {
         this.label = 'Unstructured File Loader'
         this.name = 'unstructuredFileLoader'
-        this.version = 2.0
+        this.version = 4.0
         this.type = 'Document'
         this.icon = 'unstructured-file.svg'
         this.category = 'Document Loaders'
@@ -37,19 +44,33 @@ class UnstructuredFile_DocumentLoaders implements INode {
             optional: true
         }
         this.inputs = [
+            /** Deprecated
             {
                 label: 'File Path',
                 name: 'filePath',
                 type: 'string',
-                placeholder: ''
+                placeholder: '',
+                optional: true,
+                warning:
+                    'Use the File Upload instead of File path. If file is uploaded, this path is ignored. Path will be deprecated in future releases.'
+            },
+             */
+            {
+                label: 'Files Upload',
+                name: 'fileObject',
+                type: 'file',
+                description: 'Files to be processed. Multiple files can be uploaded.',
+                fileType:
+                    '.txt, .text, .pdf, .docx, .doc, .jpg, .jpeg, .eml, .html, .htm, .md, .pptx, .ppt, .msg, .rtf, .xlsx, .xls, .odt, .epub'
             },
             {
                 label: 'Unstructured API URL',
                 name: 'unstructuredAPIUrl',
                 description:
-                    'Unstructured API URL. Read <a target="_blank" href="https://unstructured-io.github.io/unstructured/introduction.html#getting-started">more</a> on how to get started',
+                    'Unstructured API URL. Read <a target="_blank" href="https://docs.unstructured.io/api-reference/api-services/saas-api-development-guide">more</a> on how to get started',
                 type: 'string',
-                default: 'http://localhost:8000/general/v0/general'
+                placeholder: process.env.UNSTRUCTURED_API_URL || 'http://localhost:8000/general/v0/general',
+                optional: !!process.env.UNSTRUCTURED_API_URL
             },
             {
                 label: 'Strategy',
@@ -185,7 +206,7 @@ class UnstructuredFile_DocumentLoaders implements INode {
             {
                 label: 'Hi-Res Model Name',
                 name: 'hiResModelName',
-                description: 'The name of the inference model used when strategy is hi_res. Default: detectron2_onnx.',
+                description: 'The name of the inference model used when strategy is hi_res',
                 type: 'options',
                 options: [
                     {
@@ -212,8 +233,7 @@ class UnstructuredFile_DocumentLoaders implements INode {
                     }
                 ],
                 optional: true,
-                additionalParams: true,
-                default: 'detectron2_onnx'
+                additionalParams: true
             },
             {
                 label: 'Chunking Strategy',
@@ -227,8 +247,20 @@ class UnstructuredFile_DocumentLoaders implements INode {
                         name: 'None'
                     },
                     {
+                        label: 'Basic',
+                        name: 'basic'
+                    },
+                    {
                         label: 'By Title',
                         name: 'by_title'
+                    },
+                    {
+                        label: 'By Page',
+                        name: 'by_page'
+                    },
+                    {
+                        label: 'By Similarity',
+                        name: 'by_similarity'
                     }
                 ],
                 optional: true,
@@ -387,11 +419,37 @@ class UnstructuredFile_DocumentLoaders implements INode {
                 default: '500'
             },
             {
-                label: 'Metadata',
+                label: 'Additional Metadata',
                 name: 'metadata',
                 type: 'json',
+                description: 'Additional metadata to be added to the extracted documents',
                 optional: true,
                 additionalParams: true
+            },
+            {
+                label: 'Omit Metadata Keys',
+                name: 'omitMetadataKeys',
+                type: 'string',
+                rows: 4,
+                description:
+                    'Each document loader comes with a default set of metadata keys that are extracted from the document. You can use this field to omit some of the default metadata keys. The value should be a list of keys, seperated by comma. Use * to omit all metadata keys execept the ones you specify in the Additional Metadata field',
+                placeholder: 'key1, key2, key3.nestedKey1',
+                optional: true,
+                additionalParams: true
+            }
+        ]
+        this.outputs = [
+            {
+                label: 'Document',
+                name: 'document',
+                description: 'Array of document objects containing metadata and pageContent',
+                baseClasses: [...this.baseClasses, 'json']
+            },
+            {
+                label: 'Text',
+                name: 'text',
+                description: 'Concatenated string from pageContent of documents',
+                baseClasses: ['string', 'json']
             }
         ]
     }
@@ -407,15 +465,32 @@ class UnstructuredFile_DocumentLoaders implements INode {
             : ([] as SkipInferTableTypes[])
         const hiResModelName = nodeData.inputs?.hiResModelName as HiResModelName
         const includePageBreaks = nodeData.inputs?.includePageBreaks as boolean
-        const chunkingStrategy = nodeData.inputs?.chunkingStrategy as 'None' | 'by_title'
+        const chunkingStrategy = nodeData.inputs?.chunkingStrategy as string
         const metadata = nodeData.inputs?.metadata
         const sourceIdKey = (nodeData.inputs?.sourceIdKey as string) || 'source'
         const ocrLanguages = nodeData.inputs?.ocrLanguages ? JSON.parse(nodeData.inputs?.ocrLanguages as string) : ([] as string[])
         const xmlKeepTags = nodeData.inputs?.xmlKeepTags as boolean
         const multiPageSections = nodeData.inputs?.multiPageSections as boolean
-        const combineUnderNChars = nodeData.inputs?.combineUnderNChars as number
-        const newAfterNChars = nodeData.inputs?.newAfterNChars as number
-        const maxCharacters = nodeData.inputs?.maxCharacters as number
+        const combineUnderNChars = nodeData.inputs?.combineUnderNChars as string
+        const newAfterNChars = nodeData.inputs?.newAfterNChars as string
+        const maxCharacters = nodeData.inputs?.maxCharacters as string
+        const _omitMetadataKeys = nodeData.inputs?.omitMetadataKeys as string
+        const output = nodeData.outputs?.output as string
+
+        let omitMetadataKeys: string[] = []
+        if (_omitMetadataKeys) {
+            omitMetadataKeys = _omitMetadataKeys.split(',').map((key) => key.trim())
+        }
+        // give priority to upload with upsert then to fileObject (upload from UI component)
+        const fileBase64 =
+            nodeData.inputs?.pdfFile ||
+            nodeData.inputs?.txtFile ||
+            nodeData.inputs?.yamlFile ||
+            nodeData.inputs?.docxFile ||
+            nodeData.inputs?.jsonlinesFile ||
+            nodeData.inputs?.csvFile ||
+            nodeData.inputs?.jsonFile ||
+            (nodeData.inputs?.fileObject as string)
 
         const obj: UnstructuredLoaderOptions = {
             apiUrl: unstructuredAPIUrl,
@@ -428,40 +503,139 @@ class UnstructuredFile_DocumentLoaders implements INode {
             chunkingStrategy,
             ocrLanguages,
             xmlKeepTags,
-            multiPageSections,
-            combineUnderNChars,
-            newAfterNChars,
-            maxCharacters
+            multiPageSections
+        }
+
+        if (combineUnderNChars) {
+            obj.combineUnderNChars = parseInt(combineUnderNChars, 10)
+        }
+
+        if (newAfterNChars) {
+            obj.newAfterNChars = parseInt(newAfterNChars, 10)
+        }
+
+        if (maxCharacters) {
+            obj.maxCharacters = parseInt(maxCharacters, 10)
         }
 
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
         const unstructuredAPIKey = getCredentialParam('unstructuredAPIKey', credentialData, nodeData)
         if (unstructuredAPIKey) obj.apiKey = unstructuredAPIKey
 
-        const loader = new UnstructuredLoader(filePath, obj)
-        let docs = await loader.load()
+        let docs: IDocument[] = []
+        let files: string[] = []
+
+        if (fileBase64) {
+            const loader = new UnstructuredLoader(obj)
+            //FILE-STORAGE::["CONTRIBUTING.md","LICENSE.md","README.md"]
+            if (fileBase64.startsWith('FILE-STORAGE::')) {
+                const fileName = fileBase64.replace('FILE-STORAGE::', '')
+                if (fileName.startsWith('[') && fileName.endsWith(']')) {
+                    files = JSON.parse(fileName)
+                } else {
+                    files = [fileName]
+                }
+                const orgId = options.orgId
+                const chatflowid = options.chatflowid
+
+                for (const file of files) {
+                    if (!file) continue
+                    const fileData = await getFileFromStorage(file, orgId, chatflowid)
+                    const loaderDocs = await loader.loadAndSplitBuffer(fileData, file)
+                    docs.push(...loaderDocs)
+                }
+            } else {
+                if (fileBase64.startsWith('[') && fileBase64.endsWith(']')) {
+                    files = JSON.parse(fileBase64)
+                } else {
+                    files = [fileBase64]
+                }
+
+                for (const file of files) {
+                    if (!file) continue
+                    const splitDataURI = file.split(',')
+                    const filename = splitDataURI.pop()?.split(':')[1] ?? ''
+                    const bf = Buffer.from(splitDataURI.pop() || '', 'base64')
+                    const loaderDocs = await loader.loadAndSplitBuffer(bf, filename)
+                    docs.push(...loaderDocs)
+                }
+            }
+        } else if (filePath) {
+            if (!filePath || typeof filePath !== 'string') {
+                throw new Error('Invalid file path format')
+            }
+
+            if (isPathTraversal(filePath)) {
+                throw new Error('Invalid path characters detected in filePath - path traversal not allowed')
+            }
+
+            const parsedPath = path.parse(filePath)
+            const sanitizedFilename = sanitize(parsedPath.base)
+
+            if (!sanitizedFilename || sanitizedFilename.trim() === '') {
+                throw new Error('Invalid filename after sanitization')
+            }
+
+            const sanitizedFilePath = path.join(parsedPath.dir, sanitizedFilename)
+
+            if (!path.isAbsolute(sanitizedFilePath)) {
+                throw new Error('File path must be absolute')
+            }
+
+            if (sanitizedFilePath.includes('..')) {
+                throw new Error('Invalid file path - directory traversal not allowed')
+            }
+
+            const loader = new LCUnstructuredLoader(sanitizedFilePath, obj)
+            const loaderDocs = await loader.load()
+            docs.push(...loaderDocs)
+        } else {
+            throw new Error('File path or File upload is required')
+        }
 
         if (metadata) {
             const parsedMetadata = typeof metadata === 'object' ? metadata : JSON.parse(metadata)
             docs = docs.map((doc) => ({
                 ...doc,
-                metadata: {
-                    ...doc.metadata,
-                    ...parsedMetadata,
-                    [sourceIdKey]: doc.metadata[sourceIdKey] || sourceIdKey
-                }
+                metadata:
+                    _omitMetadataKeys === '*'
+                        ? {
+                              ...parsedMetadata
+                          }
+                        : omit(
+                              {
+                                  ...doc.metadata,
+                                  ...parsedMetadata,
+                                  [sourceIdKey]: doc.metadata[sourceIdKey] || sourceIdKey
+                              },
+                              omitMetadataKeys
+                          )
             }))
         } else {
             docs = docs.map((doc) => ({
                 ...doc,
-                metadata: {
-                    ...doc.metadata,
-                    [sourceIdKey]: doc.metadata[sourceIdKey] || sourceIdKey
-                }
+                metadata:
+                    _omitMetadataKeys === '*'
+                        ? {}
+                        : omit(
+                              {
+                                  ...doc.metadata,
+                                  [sourceIdKey]: doc.metadata[sourceIdKey] || sourceIdKey
+                              },
+                              omitMetadataKeys
+                          )
             }))
         }
 
-        return docs
+        if (output === 'document') {
+            return docs
+        } else {
+            let finaltext = ''
+            for (const doc of docs) {
+                finaltext += `${doc.pageContent}\n`
+            }
+            return handleEscapeCharacters(finaltext, false)
+        }
     }
 }
 

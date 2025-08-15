@@ -2,7 +2,7 @@ import { BaseRetriever } from '@langchain/core/retrievers'
 import { BaseLanguageModel } from '@langchain/core/language_models/base'
 import { RetrievalQAChain } from 'langchain/chains'
 import { ConsoleCallbackHandler, CustomChainHandler, additionalCallbacks } from '../../../src/handler'
-import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
+import { ICommonObject, INode, INodeData, INodeParams, IServerSideEventStreamer } from '../../../src/Interface'
 import { getBaseClasses } from '../../../src/utils'
 import { checkInputs, Moderation, streamResponse } from '../../moderation/Moderation'
 import { formatResponse } from '../../outputparsers/OutputParserHelpers'
@@ -17,6 +17,7 @@ class RetrievalQAChain_Chains implements INode {
     baseClasses: string[]
     description: string
     inputs: INodeParams[]
+    badge: string
 
     constructor() {
         this.label = 'Retrieval QA Chain'
@@ -24,6 +25,7 @@ class RetrievalQAChain_Chains implements INode {
         this.version = 2.0
         this.type = 'RetrievalQAChain'
         this.icon = 'qa.svg'
+        this.badge = 'DEPRECATING'
         this.category = 'Chains'
         this.description = 'QA chain to answer a question based on the retrieved documents'
         this.baseClasses = [this.type, ...getBaseClasses(RetrievalQAChain)]
@@ -60,24 +62,31 @@ class RetrievalQAChain_Chains implements INode {
     async run(nodeData: INodeData, input: string, options: ICommonObject): Promise<string | object> {
         const chain = nodeData.instance as RetrievalQAChain
         const moderations = nodeData.inputs?.inputModeration as Moderation[]
+
+        const shouldStreamResponse = options.shouldStreamResponse
+        const sseStreamer: IServerSideEventStreamer = options.sseStreamer as IServerSideEventStreamer
+        const chatId = options.chatId
+
         if (moderations && moderations.length > 0) {
             try {
                 // Use the output of the moderation chain as input for the Retrieval QA Chain
                 input = await checkInputs(moderations, input)
             } catch (e) {
                 await new Promise((resolve) => setTimeout(resolve, 500))
-                streamResponse(options.socketIO && options.socketIOClientId, e.message, options.socketIO, options.socketIOClientId)
+                if (shouldStreamResponse) {
+                    streamResponse(sseStreamer, chatId, e.message)
+                }
                 return formatResponse(e.message)
             }
         }
         const obj = {
             query: input
         }
-        const loggerHandler = new ConsoleCallbackHandler(options.logger)
+        const loggerHandler = new ConsoleCallbackHandler(options.logger, options?.orgId)
         const callbacks = await additionalCallbacks(nodeData, options)
 
-        if (options.socketIO && options.socketIOClientId) {
-            const handler = new CustomChainHandler(options.socketIO, options.socketIOClientId)
+        if (shouldStreamResponse) {
+            const handler = new CustomChainHandler(sseStreamer, chatId)
             const res = await chain.call(obj, [loggerHandler, handler, ...callbacks])
             return res?.text
         } else {

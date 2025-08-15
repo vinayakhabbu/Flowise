@@ -23,6 +23,7 @@ class AutoGPT_Agents implements INode {
     category: string
     baseClasses: string[]
     inputs: INodeParams[]
+    badge: string
 
     constructor() {
         this.label = 'AutoGPT'
@@ -30,6 +31,7 @@ class AutoGPT_Agents implements INode {
         this.version = 2.0
         this.type = 'AutoGPT'
         this.category = 'Agents'
+        this.badge = 'DEPRECATING'
         this.icon = 'autogpt.svg'
         this.description = 'Autonomous agent with chain of thoughts for self-guided task completion'
         this.baseClasses = ['AutoGPT']
@@ -113,7 +115,9 @@ class AutoGPT_Agents implements INode {
                 input = await checkInputs(moderations, input)
             } catch (e) {
                 await new Promise((resolve) => setTimeout(resolve, 500))
-                //streamResponse(options.socketIO && options.socketIOClientId, e.message, options.socketIO, options.socketIOClientId)
+                // if (options.shouldStreamResponse) {
+                //     streamResponse(options.sseStreamer, options.chatId, e.message)
+                // }
                 return formatResponse(e.message)
             }
         }

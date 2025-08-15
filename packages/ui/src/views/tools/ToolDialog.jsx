@@ -14,9 +14,13 @@ import DeleteIcon from '@mui/icons-material/Delete'
 import ConfirmDialog from '@/ui-component/dialog/ConfirmDialog'
 import { CodeEditor } from '@/ui-component/editor/CodeEditor'
 import HowToUseFunctionDialog from './HowToUseFunctionDialog'
+import { PermissionButton, StyledPermissionButton } from '@/ui-component/button/RBACButtons'
+import { Available } from '@/ui-component/rbac/available'
+import ExportAsTemplateDialog from '@/ui-component/dialog/ExportAsTemplateDialog'
+import PasteJSONDialog from './PasteJSONDialog'
 
 // Icons
-import { IconX, IconFileDownload, IconPlus } from '@tabler/icons'
+import { IconX, IconFileDownload, IconPlus, IconTemplate, IconCode } from '@tabler/icons-react'
 
 // API
 import toolsApi from '@/api/tools'
@@ -33,7 +37,7 @@ import { HIDE_CANVAS_DIALOG, SHOW_CANVAS_DIALOG } from '@/store/actions'
 const exampleAPIFunc = `/*
 * You can use any libraries imported in Flowise
 * You can use properties specified in Input Schema as variables. Ex: Property = userid, Variable = $userid
-* You can get default flow config: $flow.sessionId, $flow.chatId, $flow.chatflowId, $flow.input
+* You can get default flow config: $flow.sessionId, $flow.chatId, $flow.chatflowId, $flow.input, $flow.state
 * You can get custom variables: $vars.<variable-name>
 * Must return a string value at the end of function
 */
@@ -79,6 +83,11 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
     const [toolFunc, setToolFunc] = useState('')
     const [showHowToDialog, setShowHowToDialog] = useState(false)
 
+    const [exportAsTemplateDialogOpen, setExportAsTemplateDialogOpen] = useState(false)
+    const [exportAsTemplateDialogProps, setExportAsTemplateDialogProps] = useState({})
+
+    const [showPasteJSONDialog, setShowPasteJSONDialog] = useState(false)
+
     const deleteItem = useCallback(
         (id) => () => {
             setTimeout(() => {
@@ -103,6 +112,20 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
                 return allRows
             })
         })
+    }
+
+    const onSaveAsTemplate = () => {
+        setExportAsTemplateDialogProps({
+            title: 'Export As Template',
+            tool: {
+                name: toolName,
+                description: toolDesc,
+                iconSrc: toolIcon,
+                schema: toolSchema,
+                func: toolFunc
+            }
+        })
+        setExportAsTemplateDialogOpen(true)
     }
 
     const onRowUpdate = (newRow) => {
@@ -161,7 +184,7 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
     }, [getSpecificToolApi.data])
 
     useEffect(() => {
-        if (getSpecificToolApi.error) {
+        if (getSpecificToolApi.error && setError) {
             setError(getSpecificToolApi.error)
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -222,7 +245,9 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
                 delete toolData.createdDate
                 delete toolData.updatedDate
                 let dataStr = JSON.stringify(toolData, null, 2)
-                let dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(dataStr)
+                //let dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(dataStr)
+                const blob = new Blob([dataStr], { type: 'application/json' })
+                const dataUri = URL.createObjectURL(blob)
 
                 let exportFileDefaultName = `${toolName}-CustomTool.json`
 
@@ -389,6 +414,11 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
         }
     }
 
+    const handlePastedJSON = (formattedData) => {
+        setToolSchema(formattedData)
+        setShowPasteJSONDialog(false)
+    }
+
     const component = show ? (
         <Dialog
             fullWidth
@@ -401,11 +431,30 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
             <DialogTitle sx={{ fontSize: '1rem', p: 3, pb: 0 }} id='alert-dialog-title'>
                 <Box sx={{ display: 'flex', flexDirection: 'row', justifyContent: 'space-between' }}>
                     {dialogProps.title}
-                    {dialogProps.type === 'EDIT' && (
-                        <Button variant='outlined' onClick={() => exportTool()} startIcon={<IconFileDownload />}>
-                            Export
-                        </Button>
-                    )}
+                    <Box>
+                        {dialogProps.type === 'EDIT' && (
+                            <>
+                                <PermissionButton
+                                    permissionId={'templates:toolexport'}
+                                    style={{ marginRight: '10px' }}
+                                    variant='outlined'
+                                    onClick={() => onSaveAsTemplate()}
+                                    startIcon={<IconTemplate />}
+                                    color='secondary'
+                                >
+                                    Save As Template
+                                </PermissionButton>
+                                <PermissionButton
+                                    permissionId={'tools:export'}
+                                    variant='outlined'
+                                    onClick={() => exportTool()}
+                                    startIcon={<IconFileDownload />}
+                                >
+                                    Export
+                                </PermissionButton>
+                            </>
+                        )}
+                    </Box>
                 </Box>
             </DialogTitle>
             <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, maxHeight: '75vh', position: 'relative', px: 3, pb: 3 }}>
@@ -474,9 +523,14 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
                                 <TooltipWithParser title={'What is the input format in JSON?'} />
                             </Stack>
                             {dialogProps.type !== 'TEMPLATE' && (
-                                <Button variant='outlined' onClick={addNewRow} startIcon={<IconPlus />}>
-                                    Add Item
-                                </Button>
+                                <Stack direction='row' spacing={1}>
+                                    <Button variant='outlined' onClick={() => setShowPasteJSONDialog(true)} startIcon={<IconCode />}>
+                                        Paste JSON
+                                    </Button>
+                                    <Button variant='outlined' onClick={addNewRow} startIcon={<IconPlus />}>
+                                        Add Item
+                                    </Button>
+                                </Stack>
                             )}
                         </Stack>
                         <Grid columns={columns} rows={toolSchema} disabled={dialogProps.type === 'TEMPLATE'} onRowUpdate={onRowUpdate} />
@@ -515,27 +569,47 @@ const ToolDialog = ({ show, dialogProps, onUseTemplate, onCancel, onConfirm, set
             </DialogContent>
             <DialogActions sx={{ p: 3 }}>
                 {dialogProps.type === 'EDIT' && (
-                    <StyledButton color='error' variant='contained' onClick={() => deleteTool()}>
+                    <StyledPermissionButton permissionId={'tools:delete'} color='error' variant='contained' onClick={() => deleteTool()}>
                         Delete
-                    </StyledButton>
+                    </StyledPermissionButton>
                 )}
                 {dialogProps.type === 'TEMPLATE' && (
-                    <StyledButton color='secondary' variant='contained' onClick={useToolTemplate}>
-                        Use Template
-                    </StyledButton>
+                    <Available permission={'tools:view,tools:create'}>
+                        <StyledButton color='secondary' variant='contained' onClick={useToolTemplate}>
+                            Use Template
+                        </StyledButton>
+                    </Available>
                 )}
                 {dialogProps.type !== 'TEMPLATE' && (
-                    <StyledButton
+                    <StyledPermissionButton
+                        permissionId={'tools:update,tools:create'}
                         disabled={!(toolName && toolDesc)}
                         variant='contained'
                         onClick={() => (dialogProps.type === 'ADD' || dialogProps.type === 'IMPORT' ? addNewTool() : saveTool())}
                     >
                         {dialogProps.confirmButtonName}
-                    </StyledButton>
+                    </StyledPermissionButton>
                 )}
             </DialogActions>
             <ConfirmDialog />
+            {exportAsTemplateDialogOpen && (
+                <ExportAsTemplateDialog
+                    show={exportAsTemplateDialogOpen}
+                    dialogProps={exportAsTemplateDialogProps}
+                    onCancel={() => setExportAsTemplateDialogOpen(false)}
+                />
+            )}
+
             <HowToUseFunctionDialog show={showHowToDialog} onCancel={() => setShowHowToDialog(false)} />
+
+            {showPasteJSONDialog && (
+                <PasteJSONDialog
+                    show={showPasteJSONDialog}
+                    onCancel={() => setShowPasteJSONDialog(false)}
+                    onConfirm={handlePastedJSON}
+                    customization={customization}
+                />
+            )}
         </Dialog>
     ) : null
 

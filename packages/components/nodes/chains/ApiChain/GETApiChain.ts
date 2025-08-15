@@ -2,7 +2,7 @@ import { BaseLanguageModel } from '@langchain/core/language_models/base'
 import { PromptTemplate } from '@langchain/core/prompts'
 import { APIChain } from 'langchain/chains'
 import { getBaseClasses } from '../../../src/utils'
-import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
+import { ICommonObject, INode, INodeData, INodeParams, IServerSideEventStreamer } from '../../../src/Interface'
 import { ConsoleCallbackHandler, CustomChainHandler, additionalCallbacks } from '../../../src/handler'
 
 export const API_URL_RAW_PROMPT_TEMPLATE = `You are given the below API Documentation:
@@ -26,6 +26,7 @@ class GETApiChain_Chains implements INode {
     baseClasses: string[]
     description: string
     inputs: INodeParams[]
+    badge: string
 
     constructor() {
         this.label = 'GET API Chain'
@@ -34,6 +35,7 @@ class GETApiChain_Chains implements INode {
         this.type = 'GETApiChain'
         this.icon = 'get.svg'
         this.category = 'Chains'
+        this.badge = 'DEPRECATING'
         this.description = 'Chain to run queries against GET API'
         this.baseClasses = [this.type, ...getBaseClasses(APIChain)]
         this.inputs = [
@@ -98,11 +100,14 @@ class GETApiChain_Chains implements INode {
         const ansPrompt = nodeData.inputs?.ansPrompt as string
 
         const chain = await getAPIChain(apiDocs, model, headers, urlPrompt, ansPrompt)
-        const loggerHandler = new ConsoleCallbackHandler(options.logger)
+        const loggerHandler = new ConsoleCallbackHandler(options.logger, options?.orgId)
         const callbacks = await additionalCallbacks(nodeData, options)
+        const shouldStreamResponse = options.shouldStreamResponse
+        const sseStreamer: IServerSideEventStreamer = options.sseStreamer as IServerSideEventStreamer
+        const chatId = options.chatId
 
-        if (options.socketIO && options.socketIOClientId) {
-            const handler = new CustomChainHandler(options.socketIO, options.socketIOClientId, 2)
+        if (shouldStreamResponse) {
+            const handler = new CustomChainHandler(sseStreamer, chatId)
             const res = await chain.run(input, [loggerHandler, handler, ...callbacks])
             return res
         } else {

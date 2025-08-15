@@ -69,6 +69,7 @@ class BufferWindowMemory_Memory implements INode {
         const appDataSource = options.appDataSource as DataSource
         const databaseEntities = options.databaseEntities as IDatabaseEntity
         const chatflowid = options.chatflowid as string
+        const orgId = options.orgId as string
 
         const obj: Partial<BufferWindowMemoryInput> & BufferMemoryExtendedInput = {
             returnMessages: true,
@@ -77,7 +78,8 @@ class BufferWindowMemory_Memory implements INode {
             k: parseInt(k, 10),
             appDataSource,
             databaseEntities,
-            chatflowid
+            chatflowid,
+            orgId
         }
 
         return new BufferWindowMemoryExtended(obj)
@@ -89,12 +91,14 @@ interface BufferMemoryExtendedInput {
     appDataSource: DataSource
     databaseEntities: IDatabaseEntity
     chatflowid: string
+    orgId: string
 }
 
 class BufferWindowMemoryExtended extends FlowiseWindowMemory implements MemoryMethods {
     appDataSource: DataSource
     databaseEntities: IDatabaseEntity
     chatflowid: string
+    orgId: string
     sessionId = ''
 
     constructor(fields: BufferWindowMemoryInput & BufferMemoryExtendedInput) {
@@ -103,9 +107,14 @@ class BufferWindowMemoryExtended extends FlowiseWindowMemory implements MemoryMe
         this.appDataSource = fields.appDataSource
         this.databaseEntities = fields.databaseEntities
         this.chatflowid = fields.chatflowid
+        this.orgId = fields.orgId
     }
 
-    async getChatMessages(overrideSessionId = '', returnBaseMessages = false): Promise<IMessage[] | BaseMessage[]> {
+    async getChatMessages(
+        overrideSessionId = '',
+        returnBaseMessages = false,
+        prependMessages?: IMessage[]
+    ): Promise<IMessage[] | BaseMessage[]> {
         const id = overrideSessionId ? overrideSessionId : this.sessionId
         if (!id) return []
 
@@ -114,17 +123,23 @@ class BufferWindowMemoryExtended extends FlowiseWindowMemory implements MemoryMe
                 sessionId: id,
                 chatflowid: this.chatflowid
             },
-            take: this.k + 1,
             order: {
-                createdDate: 'DESC' // we get the latest top K
+                createdDate: 'ASC'
             }
         })
 
-        // reverse the order of human and ai messages
-        if (chatMessage.length) chatMessage.reverse()
+        if (this.k <= 0) {
+            chatMessage = []
+        } else {
+            chatMessage = chatMessage.slice(-this.k * 2)
+        }
+
+        if (prependMessages?.length) {
+            chatMessage.unshift(...prependMessages)
+        }
 
         if (returnBaseMessages) {
-            return mapChatMessageToBaseMessage(chatMessage)
+            return await mapChatMessageToBaseMessage(chatMessage, this.orgId)
         }
 
         let returnIMessages: IMessage[] = []

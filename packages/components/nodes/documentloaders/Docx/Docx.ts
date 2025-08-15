@@ -1,7 +1,8 @@
-import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
+import { omit } from 'lodash'
+import { ICommonObject, IDocument, INode, INodeData, INodeParams, INodeOutputsValue } from '../../../src/Interface'
 import { TextSplitter } from 'langchain/text_splitter'
-import { DocxLoader } from 'langchain/document_loaders/fs/docx'
-import { getFileFromStorage } from '../../../src'
+import { DocxLoader } from '@langchain/community/document_loaders/fs/docx'
+import { getFileFromStorage, handleEscapeCharacters } from '../../../src'
 
 class Docx_DocumentLoaders implements INode {
     label: string
@@ -13,11 +14,12 @@ class Docx_DocumentLoaders implements INode {
     category: string
     baseClasses: string[]
     inputs: INodeParams[]
+    outputs: INodeOutputsValue[]
 
     constructor() {
         this.label = 'Docx File'
         this.name = 'docxFile'
-        this.version = 1.0
+        this.version = 2.0
         this.type = 'Document'
         this.icon = 'docx.svg'
         this.category = 'Document Loaders'
@@ -37,11 +39,37 @@ class Docx_DocumentLoaders implements INode {
                 optional: true
             },
             {
-                label: 'Metadata',
+                label: 'Additional Metadata',
                 name: 'metadata',
                 type: 'json',
+                description: 'Additional metadata to be added to the extracted documents',
                 optional: true,
                 additionalParams: true
+            },
+            {
+                label: 'Omit Metadata Keys',
+                name: 'omitMetadataKeys',
+                type: 'string',
+                rows: 4,
+                description:
+                    'Each document loader comes with a default set of metadata keys that are extracted from the document. You can use this field to omit some of the default metadata keys. The value should be a list of keys, seperated by comma. Use * to omit all metadata keys execept the ones you specify in the Additional Metadata field',
+                placeholder: 'key1, key2, key3.nestedKey1',
+                optional: true,
+                additionalParams: true
+            }
+        ]
+        this.outputs = [
+            {
+                label: 'Document',
+                name: 'document',
+                description: 'Array of document objects containing metadata and pageContent',
+                baseClasses: [...this.baseClasses, 'json']
+            },
+            {
+                label: 'Text',
+                name: 'text',
+                description: 'Concatenated string from pageContent of documents',
+                baseClasses: ['string', 'json']
             }
         ]
     }
@@ -50,8 +78,15 @@ class Docx_DocumentLoaders implements INode {
         const textSplitter = nodeData.inputs?.textSplitter as TextSplitter
         const docxFileBase64 = nodeData.inputs?.docxFile as string
         const metadata = nodeData.inputs?.metadata
+        const _omitMetadataKeys = nodeData.inputs?.omitMetadataKeys as string
+        const output = nodeData.outputs?.output as string
 
-        let alldocs = []
+        let omitMetadataKeys: string[] = []
+        if (_omitMetadataKeys) {
+            omitMetadataKeys = _omitMetadataKeys.split(',').map((key) => key.trim())
+        }
+
+        let docs: IDocument[] = []
         let files: string[] = []
 
         if (docxFileBase64.startsWith('FILE-STORAGE::')) {
@@ -61,19 +96,21 @@ class Docx_DocumentLoaders implements INode {
             } else {
                 files = [fileName]
             }
+            const orgId = options.orgId
             const chatflowid = options.chatflowid
 
             for (const file of files) {
-                const fileData = await getFileFromStorage(file, chatflowid)
+                if (!file) continue
+                const fileData = await getFileFromStorage(file, orgId, chatflowid)
                 const blob = new Blob([fileData])
                 const loader = new DocxLoader(blob)
 
                 if (textSplitter) {
-                    const docs = await loader.loadAndSplit(textSplitter)
-                    alldocs.push(...docs)
+                    let splittedDocs = await loader.load()
+                    splittedDocs = await textSplitter.splitDocuments(splittedDocs)
+                    docs.push(...splittedDocs)
                 } else {
-                    const docs = await loader.load()
-                    alldocs.push(...docs)
+                    docs.push(...(await loader.load()))
                 }
             }
         } else {
@@ -84,6 +121,7 @@ class Docx_DocumentLoaders implements INode {
             }
 
             for (const file of files) {
+                if (!file) continue
                 const splitDataURI = file.split(',')
                 splitDataURI.pop()
                 const bf = Buffer.from(splitDataURI.pop() || '', 'base64')
@@ -91,32 +129,56 @@ class Docx_DocumentLoaders implements INode {
                 const loader = new DocxLoader(blob)
 
                 if (textSplitter) {
-                    const docs = await loader.loadAndSplit(textSplitter)
-                    alldocs.push(...docs)
+                    let splittedDocs = await loader.load()
+                    splittedDocs = await textSplitter.splitDocuments(splittedDocs)
+                    docs.push(...splittedDocs)
                 } else {
-                    const docs = await loader.load()
-                    alldocs.push(...docs)
+                    docs.push(...(await loader.load()))
                 }
             }
         }
 
         if (metadata) {
             const parsedMetadata = typeof metadata === 'object' ? metadata : JSON.parse(metadata)
-            let finaldocs = []
-            for (const doc of alldocs) {
-                const newdoc = {
-                    ...doc,
-                    metadata: {
-                        ...doc.metadata,
-                        ...parsedMetadata
-                    }
-                }
-                finaldocs.push(newdoc)
-            }
-            return finaldocs
+            docs = docs.map((doc) => ({
+                ...doc,
+                metadata:
+                    _omitMetadataKeys === '*'
+                        ? {
+                              ...parsedMetadata
+                          }
+                        : omit(
+                              {
+                                  ...doc.metadata,
+                                  ...parsedMetadata
+                              },
+                              omitMetadataKeys
+                          )
+            }))
+        } else {
+            docs = docs.map((doc) => ({
+                ...doc,
+                metadata:
+                    _omitMetadataKeys === '*'
+                        ? {}
+                        : omit(
+                              {
+                                  ...doc.metadata
+                              },
+                              omitMetadataKeys
+                          )
+            }))
         }
 
-        return alldocs
+        if (output === 'document') {
+            return docs
+        } else {
+            let finaltext = ''
+            for (const doc of docs) {
+                finaltext += `${doc.pageContent}\n`
+            }
+            return handleEscapeCharacters(finaltext, false)
+        }
     }
 }
 

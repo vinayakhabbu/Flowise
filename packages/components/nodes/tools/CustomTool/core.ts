@@ -1,9 +1,9 @@
 import { z } from 'zod'
-import { NodeVM } from 'vm2'
 import { RunnableConfig } from '@langchain/core/runnables'
 import { StructuredTool, ToolParams } from '@langchain/core/tools'
 import { CallbackManagerForToolRun, Callbacks, CallbackManager, parseCallbackConfigArg } from '@langchain/core/callbacks/manager'
-import { availableDependencies, defaultAllowBuiltInDep, prepareSandboxVars } from '../../../src/utils'
+import { executeJavaScriptCode, createCodeExecutionSandbox } from '../../../src/utils'
+import { ICommonObject } from '../../../src/Interface'
 
 class ToolInputParsingException extends Error {
     output?: string
@@ -41,6 +41,7 @@ export class DynamicStructuredTool<
 
     func: DynamicStructuredToolInput['func']
 
+    // @ts-ignore
     schema: T
     private variables: any[]
     private flowObj: any
@@ -59,7 +60,7 @@ export class DynamicStructuredTool<
         arg: z.output<T>,
         configArg?: RunnableConfig | Callbacks,
         tags?: string[],
-        flowConfig?: { sessionId?: string; chatId?: string; input?: string }
+        flowConfig?: { sessionId?: string; chatId?: string; input?: string; state?: ICommonObject }
     ): Promise<string> {
         const config = parseCallbackConfigArg(configArg)
         if (config.runName === undefined) {
@@ -96,6 +97,9 @@ export class DynamicStructuredTool<
             await runManager?.handleToolError(e)
             throw e
         }
+        if (result && typeof result !== 'string') {
+            result = JSON.stringify(result)
+        }
         await runManager?.handleToolEnd(result)
         return result
     }
@@ -104,39 +108,25 @@ export class DynamicStructuredTool<
     protected async _call(
         arg: z.output<T>,
         _?: CallbackManagerForToolRun,
-        flowConfig?: { sessionId?: string; chatId?: string; input?: string }
+        flowConfig?: { sessionId?: string; chatId?: string; input?: string; state?: ICommonObject }
     ): Promise<string> {
-        let sandbox: any = {}
+        // Create additional sandbox variables for tool arguments
+        const additionalSandbox: ICommonObject = {}
+
         if (typeof arg === 'object' && Object.keys(arg).length) {
             for (const item in arg) {
-                sandbox[`$${item}`] = arg[item]
+                additionalSandbox[`$${item}`] = arg[item]
             }
         }
 
-        sandbox['$vars'] = prepareSandboxVars(this.variables)
+        // Prepare flow object for sandbox
+        const flow = this.flowObj ? { ...this.flowObj, ...flowConfig } : {}
 
-        // inject flow properties
-        if (this.flowObj) {
-            sandbox['$flow'] = { ...this.flowObj, ...flowConfig }
-        }
+        const sandbox = createCodeExecutionSandbox('', this.variables || [], flow, additionalSandbox)
 
-        const builtinDeps = process.env.TOOL_FUNCTION_BUILTIN_DEP
-            ? defaultAllowBuiltInDep.concat(process.env.TOOL_FUNCTION_BUILTIN_DEP.split(','))
-            : defaultAllowBuiltInDep
-        const externalDeps = process.env.TOOL_FUNCTION_EXTERNAL_DEP ? process.env.TOOL_FUNCTION_EXTERNAL_DEP.split(',') : []
-        const deps = availableDependencies.concat(externalDeps)
-
-        const options = {
-            console: 'inherit',
-            sandbox,
-            require: {
-                external: { modules: deps },
-                builtin: builtinDeps
-            }
-        } as any
-
-        const vm = new NodeVM(options)
-        const response = await vm.run(`module.exports = async function() {${this.code}}()`, __dirname)
+        const response = await executeJavaScriptCode(this.code, sandbox, {
+            timeout: 10000
+        })
 
         return response
     }

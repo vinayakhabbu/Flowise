@@ -22,7 +22,7 @@ import useApi from '@/hooks/useApi'
 
 import './ExpandTextDialog.css'
 
-const ExpandTextDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
+const ExpandTextDialog = ({ show, dialogProps, onCancel, onInputHintDialogClicked, onConfirm }) => {
     const portalElement = document.getElementById('portal')
 
     const theme = useTheme()
@@ -38,12 +38,17 @@ const ExpandTextDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
     const executeCustomFunctionNodeApi = useApi(nodesApi.executeCustomFunctionNode)
 
     useEffect(() => {
-        if (dialogProps.value) setInputValue(dialogProps.value)
+        if (dialogProps.value) {
+            setInputValue(dialogProps.value)
+        }
         if (dialogProps.inputParam) {
             setInputParam(dialogProps.inputParam)
             if (dialogProps.inputParam.type === 'code') {
                 setLanguageType('js')
             }
+        }
+        if (dialogProps.languageType) {
+            setLanguageType(dialogProps.languageType)
         }
 
         return () => {
@@ -91,9 +96,22 @@ const ExpandTextDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
                 <div style={{ display: 'flex', flexDirection: 'row' }}>
                     {inputParam && (inputParam.type === 'string' || inputParam.type === 'code') && (
                         <div style={{ flex: 70 }}>
-                            <Typography sx={{ mb: 2, ml: 1 }} variant='h4'>
-                                {inputParam.label}
-                            </Typography>
+                            <div style={{ marginBottom: '10px', display: 'flex', flexDirection: 'row' }}>
+                                <Typography variant='h4'>{inputParam.label}</Typography>
+                                <div style={{ flex: 1 }} />
+                                {inputParam.hint && (
+                                    <Button
+                                        sx={{ p: 0, px: 2 }}
+                                        color='secondary'
+                                        variant='text'
+                                        onClick={() => {
+                                            onInputHintDialogClicked(inputParam.hint)
+                                        }}
+                                    >
+                                        {inputParam.hint.label}
+                                    </Button>
+                                )}
+                            </div>
                             <PerfectScrollbar
                                 style={{
                                     border: '1px solid',
@@ -113,8 +131,13 @@ const ExpandTextDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
                                     lang={languageType}
                                     placeholder={inputParam.placeholder}
                                     basicSetup={
-                                        languageType === 'json'
-                                            ? { lineNumbers: false, foldGutter: false, autocompletion: false, highlightActiveLine: false }
+                                        languageType !== 'js'
+                                            ? {
+                                                  lineNumbers: false,
+                                                  foldGutter: false,
+                                                  autocompletion: false,
+                                                  highlightActiveLine: false
+                                              }
                                             : {}
                                     }
                                     onValueChange={(code) => setInputValue(code)}
@@ -123,7 +146,7 @@ const ExpandTextDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
                         </div>
                     )}
                 </div>
-                {languageType === 'js' && (
+                {languageType === 'js' && !inputParam.hideCodeExecute && (
                     <LoadingButton
                         sx={{
                             mt: 2,
@@ -152,7 +175,9 @@ const ExpandTextDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
                     <div style={{ marginTop: '15px' }}>
                         <CodeEditor
                             disabled={true}
-                            value={codeExecutedResult}
+                            value={
+                                typeof codeExecutedResult === 'object' ? JSON.stringify(codeExecutedResult, null, 2) : codeExecutedResult
+                            }
                             height='max-content'
                             theme={customization.isDarkMode ? 'dark' : 'light'}
                             lang={'js'}
@@ -177,7 +202,8 @@ ExpandTextDialog.propTypes = {
     show: PropTypes.bool,
     dialogProps: PropTypes.object,
     onCancel: PropTypes.func,
-    onConfirm: PropTypes.func
+    onConfirm: PropTypes.func,
+    onInputHintDialogClicked: PropTypes.func
 }
 
 export default ExpandTextDialog

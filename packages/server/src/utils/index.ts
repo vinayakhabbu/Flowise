@@ -1,7 +1,13 @@
+/**
+ * Strictly no getRepository, appServer here, must be passed as parameter
+ */
+
 import path from 'path'
 import fs from 'fs'
 import logger from './logger'
+import { v4 as uuidv4 } from 'uuid'
 import {
+    IChatFlow,
     IComponentCredentials,
     IComponentNodes,
     ICredentialDataDecrypted,
@@ -11,11 +17,14 @@ import {
     INodeData,
     INodeDependencies,
     INodeDirectedGraph,
+    INodeOverrides,
     INodeQueue,
     IOverrideConfig,
     IReactFlowEdge,
     IReactFlowNode,
+    IVariable,
     IVariableDict,
+    IVariableOverride,
     IncomingInput
 } from '../Interface'
 import { cloneDeep, get, isEqual } from 'lodash'
@@ -28,33 +37,71 @@ import {
     IDatabaseEntity,
     IMessage,
     FlowiseMemory,
-    IFileUpload
+    IFileUpload,
+    getS3Config
 } from 'flowise-components'
 import { randomBytes } from 'crypto'
 import { AES, enc } from 'crypto-js'
-
+import multer from 'multer'
+import multerS3 from 'multer-s3'
+import MulterGoogleCloudStorage from 'multer-cloud-storage'
 import { ChatFlow } from '../database/entities/ChatFlow'
 import { ChatMessage } from '../database/entities/ChatMessage'
 import { Credential } from '../database/entities/Credential'
 import { Tool } from '../database/entities/Tool'
 import { Assistant } from '../database/entities/Assistant'
+import { Lead } from '../database/entities/Lead'
 import { DataSource } from 'typeorm'
 import { CachePool } from '../CachePool'
 import { Variable } from '../database/entities/Variable'
+import { DocumentStore } from '../database/entities/DocumentStore'
+import { DocumentStoreFileChunk } from '../database/entities/DocumentStoreFileChunk'
 import { InternalFlowiseError } from '../errors/internalFlowiseError'
 import { StatusCodes } from 'http-status-codes'
+import {
+    CreateSecretCommand,
+    GetSecretValueCommand,
+    SecretsManagerClient,
+    SecretsManagerClientConfig
+} from '@aws-sdk/client-secrets-manager'
 
-const QUESTION_VAR_PREFIX = 'question'
-const CHAT_HISTORY_VAR_PREFIX = 'chat_history'
-const REDACTED_CREDENTIAL_VALUE = '_FLOWISE_BLANK_07167752-1a71-43b1-bf8f-4f32252165db'
+export const QUESTION_VAR_PREFIX = 'question'
+export const FILE_ATTACHMENT_PREFIX = 'file_attachment'
+export const CHAT_HISTORY_VAR_PREFIX = 'chat_history'
+export const RUNTIME_MESSAGES_LENGTH_VAR_PREFIX = 'runtime_messages_length'
+export const CURRENT_DATE_TIME_VAR_PREFIX = 'current_date_time'
+export const REDACTED_CREDENTIAL_VALUE = '_FLOWISE_BLANK_07167752-1a71-43b1-bf8f-4f32252165db'
+
+let secretsManagerClient: SecretsManagerClient | null = null
+const USE_AWS_SECRETS_MANAGER = process.env.SECRETKEY_STORAGE_TYPE === 'aws'
+if (USE_AWS_SECRETS_MANAGER) {
+    const region = process.env.SECRETKEY_AWS_REGION || 'us-east-1' // Default region if not provided
+    const accessKeyId = process.env.SECRETKEY_AWS_ACCESS_KEY
+    const secretAccessKey = process.env.SECRETKEY_AWS_SECRET_KEY
+
+    const secretManagerConfig: SecretsManagerClientConfig = {
+        region: region
+    }
+
+    if (accessKeyId && secretAccessKey) {
+        secretManagerConfig.credentials = {
+            accessKeyId,
+            secretAccessKey
+        }
+    }
+    secretsManagerClient = new SecretsManagerClient(secretManagerConfig)
+}
 
 export const databaseEntities: IDatabaseEntity = {
     ChatFlow: ChatFlow,
     ChatMessage: ChatMessage,
     Tool: Tool,
     Credential: Credential,
+    Lead: Lead,
     Assistant: Assistant,
-    Variable: Variable
+    Variable: Variable,
+    DocumentStore: DocumentStore,
+    DocumentStoreFileChunk: DocumentStoreFileChunk
 }
 
 /**
@@ -156,6 +203,22 @@ export const constructGraphs = (
     }
 
     return { graph, nodeDependencies }
+}
+
+/**
+ * Get starting node and check if flow is valid
+ * @param {INodeDependencies} nodeDependencies
+ */
+export const getStartingNode = (nodeDependencies: INodeDependencies) => {
+    // Find starting node
+    const startingNodeIds = [] as string[]
+    Object.keys(nodeDependencies).forEach((nodeId) => {
+        if (nodeDependencies[nodeId] === 0) {
+            startingNodeIds.push(nodeId)
+        }
+    })
+
+    return { startingNodeIds }
 }
 
 /**
@@ -263,9 +326,11 @@ export const getEndingNodes = (
                 endingNodeData &&
                 endingNodeData.category !== 'Chains' &&
                 endingNodeData.category !== 'Agents' &&
-                endingNodeData.category !== 'Engine'
+                endingNodeData.category !== 'Engine' &&
+                endingNodeData.category !== 'Multi Agents' &&
+                endingNodeData.category !== 'Sequential Agents'
             ) {
-                error = new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Ending node must be either a Chain or Agent`)
+                error = new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Ending node must be either a Chain or Agent or Engine`)
                 continue
             }
         }
@@ -371,38 +436,114 @@ export const saveUpsertFlowData = (nodeData: INodeData, upsertHistory: Record<st
 }
 
 /**
- * Build langchain from start to end
- * @param {string[]} startingNodeIds
+ * Check if doc loader should be bypassed, ONLY if doc loader is connected to a vector store
+ * Reason being we dont want to load the doc loader again whenever we are building the flow, because it was already done during upserting
+ * EXCEPT if the vector store is a memory vector store
+ * TODO: Remove this logic when we remove doc loader nodes from the canvas
+ * @param {IReactFlowNode} reactFlowNode
  * @param {IReactFlowNode[]} reactFlowNodes
- * @param {INodeDirectedGraph} graph
- * @param {IDepthQueue} depthQueue
- * @param {IComponentNodes} componentNodes
- * @param {string} question
- * @param {string} chatId
- * @param {string} chatflowid
- * @param {DataSource} appDataSource
- * @param {ICommonObject} overrideConfig
- * @param {CachePool} cachePool
+ * @param {IReactFlowEdge[]} reactFlowEdges
+ * @returns {boolean}
  */
-export const buildFlow = async (
-    startingNodeIds: string[],
+const checkIfDocLoaderShouldBeIgnored = (
+    reactFlowNode: IReactFlowNode,
     reactFlowNodes: IReactFlowNode[],
-    reactFlowEdges: IReactFlowEdge[],
-    graph: INodeDirectedGraph,
-    depthQueue: IDepthQueue,
-    componentNodes: IComponentNodes,
-    question: string,
-    chatHistory: IMessage[],
-    chatId: string,
-    sessionId: string,
-    chatflowid: string,
-    appDataSource: DataSource,
-    overrideConfig?: ICommonObject,
-    cachePool?: CachePool,
-    isUpsert?: boolean,
-    stopNodeId?: string,
+    reactFlowEdges: IReactFlowEdge[]
+): boolean => {
+    let outputId = ''
+
+    if (reactFlowNode.data.outputAnchors.length) {
+        if (Object.keys(reactFlowNode.data.outputs || {}).length) {
+            const output = reactFlowNode.data.outputs?.output
+            const node = reactFlowNode.data.outputAnchors[0].options?.find((anchor) => anchor.name === output)
+            if (node) outputId = (node as ICommonObject).id
+        } else {
+            outputId = (reactFlowNode.data.outputAnchors[0] as ICommonObject).id
+        }
+    }
+
+    const targetNodeId = reactFlowEdges.find((edge) => edge.sourceHandle === outputId)?.target
+
+    if (targetNodeId) {
+        const targetNodeCategory = reactFlowNodes.find((nd) => nd.id === targetNodeId)?.data.category || ''
+        const targetNodeName = reactFlowNodes.find((nd) => nd.id === targetNodeId)?.data.name || ''
+        if (targetNodeCategory === 'Vector Stores' && targetNodeName !== 'memoryVectorStore') {
+            return true
+        }
+    }
+
+    return false
+}
+
+type BuildFlowParams = {
+    startingNodeIds: string[]
+    reactFlowNodes: IReactFlowNode[]
+    reactFlowEdges: IReactFlowEdge[]
+    graph: INodeDirectedGraph
+    depthQueue: IDepthQueue
+    componentNodes: IComponentNodes
+    question: string
+    chatHistory: IMessage[]
+    chatId: string
+    sessionId: string
+    chatflowid: string
+    apiMessageId: string
+    appDataSource: DataSource
+    overrideConfig?: ICommonObject
+    apiOverrideStatus?: boolean
+    nodeOverrides?: INodeOverrides
+    availableVariables?: IVariable[]
+    variableOverrides?: IVariableOverride[]
+    cachePool?: CachePool
+    isUpsert?: boolean
+    stopNodeId?: string
     uploads?: IFileUpload[]
-) => {
+    baseURL?: string
+    orgId?: string
+    workspaceId?: string
+    subscriptionId?: string
+    usageCacheManager?: any
+    uploadedFilesContent?: string
+    updateStorageUsage?: (orgId: string, workspaceId: string, totalSize: number, usageCacheManager?: any) => void
+    checkStorage?: (orgId: string, subscriptionId: string, usageCacheManager: any) => Promise<any>
+}
+
+/**
+ * Build flow from start to end
+ * @param {BuildFlowParams} params
+ */
+export const buildFlow = async ({
+    startingNodeIds,
+    reactFlowNodes,
+    reactFlowEdges,
+    graph,
+    depthQueue,
+    componentNodes,
+    question,
+    uploadedFilesContent,
+    chatHistory,
+    apiMessageId,
+    chatId,
+    sessionId,
+    chatflowid,
+    appDataSource,
+    overrideConfig,
+    apiOverrideStatus = false,
+    nodeOverrides = {},
+    availableVariables = [],
+    variableOverrides = [],
+    cachePool,
+    isUpsert,
+    stopNodeId,
+    uploads,
+    baseURL,
+    orgId,
+    workspaceId,
+    subscriptionId,
+    usageCacheManager,
+    updateStorageUsage,
+    checkStorage
+}: BuildFlowParams) => {
     const flowNodes = cloneDeep(reactFlowNodes)
 
     let upsertHistory: Record<string, any> = {}
@@ -423,6 +564,14 @@ export const buildFlow = async (
 
     const initializedNodes: Set<string> = new Set()
     const reversedGraph = constructGraphs(reactFlowNodes, reactFlowEdges, { isReversed: true }).graph
+
+    const flowData: ICommonObject = {
+        chatflowid,
+        chatId,
+        sessionId,
+        chatHistory,
+        ...overrideConfig
+    }
     while (nodeQueue.length) {
         const { nodeId, depth } = nodeQueue.shift() as INodeQueue
 
@@ -436,33 +585,61 @@ export const buildFlow = async (
             const newNodeInstance = new nodeModule.nodeClass()
 
             let flowNodeData = cloneDeep(reactFlowNode.data)
-            if (overrideConfig) flowNodeData = replaceInputsWithConfig(flowNodeData, overrideConfig)
+
+            // Only override the config if its status is true
+            if (overrideConfig && apiOverrideStatus) {
+                flowNodeData = replaceInputsWithConfig(flowNodeData, overrideConfig, nodeOverrides, variableOverrides)
+            }
 
             if (isUpsert) upsertHistory['flowData'] = saveUpsertFlowData(flowNodeData, upsertHistory)
 
-            const reactFlowNodeData: INodeData = resolveVariables(flowNodeData, flowNodes, question, chatHistory)
+            const reactFlowNodeData: INodeData = await resolveVariables(
+                flowNodeData,
+                flowNodes,
+                question,
+                chatHistory,
+                flowData,
+                uploadedFilesContent,
+                availableVariables,
+                variableOverrides
+            )
 
-            // TODO: Avoid processing Text Splitter + Doc Loader once Upsert & Load Existing Vector Nodes are deprecated
             if (isUpsert && stopNodeId && nodeId === stopNodeId) {
-                logger.debug(`[server]: Upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                logger.debug(`[server]: [${orgId}]: Upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 const indexResult = await newNodeInstance.vectorStoreMethods!['upsert']!.call(newNodeInstance, reactFlowNodeData, {
+                    orgId,
+                    workspaceId,
+                    subscriptionId,
                     chatId,
                     sessionId,
                     chatflowid,
                     chatHistory,
+                    apiMessageId,
                     logger,
                     appDataSource,
                     databaseEntities,
                     cachePool,
+                    usageCacheManager,
                     dynamicVariables,
-                    uploads
+                    uploads,
+                    baseURL
                 })
                 if (indexResult) upsertHistory['result'] = indexResult
-                logger.debug(`[server]: Finished upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                logger.debug(`[server]: [${orgId}]: Finished upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 break
+            } else if (
+                !isUpsert &&
+                reactFlowNode.data.category === 'Document Loaders' &&
+                checkIfDocLoaderShouldBeIgnored(reactFlowNode, reactFlowNodes, reactFlowEdges)
+            ) {
+                initializedNodes.add(nodeId)
             } else {
-                logger.debug(`[server]: Initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
-                let outputResult = await newNodeInstance.init(reactFlowNodeData, question, {
+                logger.debug(`[server]: [${orgId}]: Initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                const finalQuestion = uploadedFilesContent ? `${uploadedFilesContent}\n\n${question}` : question
+                let outputResult = await newNodeInstance.init(reactFlowNodeData, finalQuestion, {
+                    orgId,
+                    workspaceId,
+                    subscriptionId,
                     chatId,
                     sessionId,
                     chatflowid,
@@ -471,8 +648,14 @@ export const buildFlow = async (
                     appDataSource,
                     databaseEntities,
                     cachePool,
+                    usageCacheManager,
+                    isUpsert,
                     dynamicVariables,
-                    uploads
+                    uploads,
+                    baseURL,
+                    componentNodes,
+                    updateStorageUsage,
+                    checkStorage
                 })
 
                 // Save dynamic variables
@@ -490,9 +673,15 @@ export const buildFlow = async (
                 if (reactFlowNode.data.name === 'ifElseFunction' && typeof outputResult === 'object') {
                     let sourceHandle = ''
                     if (outputResult.type === true) {
-                        sourceHandle = `${nodeId}-output-returnFalse-string|number|boolean|json|array`
+                        // sourceHandle = `${nodeId}-output-returnFalse-string|number|boolean|json|array`
+                        sourceHandle = (
+                            reactFlowNode.data.outputAnchors.flatMap((n) => n.options).find((n) => n?.name === 'returnFalse') as any
+                        )?.id
                     } else if (outputResult.type === false) {
-                        sourceHandle = `${nodeId}-output-returnTrue-string|number|boolean|json|array`
+                        // sourceHandle = `${nodeId}-output-returnTrue-string|number|boolean|json|array`
+                        sourceHandle = (
+                            reactFlowNode.data.outputAnchors.flatMap((n) => n.options).find((n) => n?.name === 'returnTrue') as any
+                        )?.id
                     }
 
                     const ifElseEdge = reactFlowEdges.find((edg) => edg.source === nodeId && edg.sourceHandle === sourceHandle)
@@ -511,11 +700,11 @@ export const buildFlow = async (
 
                 flowNodes[nodeIndex].data.instance = outputResult
 
-                logger.debug(`[server]: Finished initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                logger.debug(`[server]: [${orgId}]: Finished initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 initializedNodes.add(reactFlowNode.data.id)
             }
         } catch (e: any) {
-            logger.error(e)
+            logger.error(`[server]: [${orgId}]:`, e)
             throw new Error(e)
         }
 
@@ -579,6 +768,7 @@ export const clearSessionMemory = async (
     componentNodes: IComponentNodes,
     chatId: string,
     appDataSource: DataSource,
+    orgId?: string,
     sessionId?: string,
     memoryType?: string,
     isClearFromViewMessageDialog?: string
@@ -592,7 +782,7 @@ export const clearSessionMemory = async (
         const nodeInstanceFilePath = componentNodes[node.data.name].filePath as string
         const nodeModule = await import(nodeInstanceFilePath)
         const newNodeInstance = new nodeModule.nodeClass()
-        const options: ICommonObject = { chatId, appDataSource, databaseEntities, logger }
+        const options: ICommonObject = { orgId, chatId, appDataSource, databaseEntities, logger }
 
         // SessionId always take priority first because it is the sessionId used for 3rd party memory node
         if (sessionId && node.data.inputs) {
@@ -615,6 +805,61 @@ export const clearSessionMemory = async (
     }
 }
 
+export const getGlobalVariable = async (
+    overrideConfig?: ICommonObject,
+    availableVariables: IVariable[] = [],
+    variableOverrides: ICommonObject[] = []
+) => {
+    // override variables defined in overrideConfig
+    // nodeData.inputs.vars is an Object, check each property and override the variable
+    if (overrideConfig?.vars && variableOverrides) {
+        for (const propertyName of Object.getOwnPropertyNames(overrideConfig.vars)) {
+            // Check if this variable is enabled for override
+            const override = variableOverrides.find((v) => v.name === propertyName)
+            if (!override?.enabled) {
+                continue // Skip this variable if it's not enabled for override
+            }
+
+            const foundVar = availableVariables.find((v) => v.name === propertyName)
+            if (foundVar) {
+                // even if the variable was defined as runtime, we override it with static value
+                foundVar.type = 'static'
+                foundVar.value = overrideConfig.vars[propertyName]
+            } else {
+                // add it the variables, if not found locally in the db
+                availableVariables.push({
+                    name: propertyName,
+                    type: 'static',
+                    value: overrideConfig.vars[propertyName],
+                    id: '',
+                    updatedDate: new Date(),
+                    createdDate: new Date()
+                })
+            }
+        }
+    }
+
+    let vars = {}
+    if (availableVariables.length) {
+        for (const item of availableVariables) {
+            let value = item.value
+
+            // read from .env file
+            if (item.type === 'runtime') {
+                value = process.env[item.name] ?? ''
+            }
+
+            Object.defineProperty(vars, item.name, {
+                enumerable: true,
+                configurable: true,
+                writable: true,
+                value: value
+            })
+        }
+    }
+    return vars
+}
+
 /**
  * Get variable value from outputResponses.output
  * @param {string} paramValue
@@ -623,22 +868,27 @@ export const clearSessionMemory = async (
  * @param {boolean} isAcceptVariable
  * @returns {string}
  */
-export const getVariableValue = (
+export const getVariableValue = async (
     paramValue: string | object,
     reactFlowNodes: IReactFlowNode[],
     question: string,
     chatHistory: IMessage[],
-    isAcceptVariable = false
+    isAcceptVariable = false,
+    flowConfig?: ICommonObject,
+    uploadedFilesContent?: string,
+    availableVariables: IVariable[] = [],
+    variableOverrides: ICommonObject[] = []
 ) => {
     const isObject = typeof paramValue === 'object'
-    let returnVal = (isObject ? JSON.stringify(paramValue) : paramValue) ?? ''
+    const initialValue = (isObject ? JSON.stringify(paramValue) : paramValue) ?? ''
+    let returnVal = initialValue
     const variableStack = []
     const variableDict = {} as IVariableDict
     let startIdx = 0
-    const endIdx = returnVal.length - 1
+    const endIdx = initialValue.length - 1
 
     while (startIdx < endIdx) {
-        const substr = returnVal.substring(startIdx, startIdx + 2)
+        const substr = initialValue.substring(startIdx, startIdx + 2)
 
         // Store the opening double curly bracket
         if (substr === '{{') {
@@ -649,7 +899,7 @@ export const getVariableValue = (
         if (substr === '}}' && variableStack.length > 0 && variableStack[variableStack.length - 1].substr === '{{') {
             const variableStartIdx = variableStack[variableStack.length - 1].startIdx
             const variableEndIdx = startIdx
-            const variableFullPath = returnVal.substring(variableStartIdx, variableEndIdx)
+            const variableFullPath = initialValue.substring(variableStartIdx, variableEndIdx)
 
             /**
              * Apply string transformation to convert special chars:
@@ -660,8 +910,29 @@ export const getVariableValue = (
                 variableDict[`{{${variableFullPath}}}`] = handleEscapeCharacters(question, false)
             }
 
+            if (isAcceptVariable && variableFullPath === FILE_ATTACHMENT_PREFIX) {
+                variableDict[`{{${variableFullPath}}}`] = handleEscapeCharacters(uploadedFilesContent, false)
+            }
+
             if (isAcceptVariable && variableFullPath === CHAT_HISTORY_VAR_PREFIX) {
                 variableDict[`{{${variableFullPath}}}`] = handleEscapeCharacters(convertChatHistoryToText(chatHistory), false)
+            }
+
+            if (variableFullPath.startsWith('$vars.')) {
+                const vars = await getGlobalVariable(flowConfig, availableVariables, variableOverrides)
+                const variableValue = get(vars, variableFullPath.replace('$vars.', ''))
+                if (variableValue != null) {
+                    variableDict[`{{${variableFullPath}}}`] = variableValue
+                    returnVal = returnVal.split(`{{${variableFullPath}}}`).join(variableValue)
+                }
+            }
+
+            if (variableFullPath.startsWith('$flow.') && flowConfig) {
+                const variableValue = get(flowConfig, variableFullPath.replace('$flow.', ''))
+                if (variableValue != null) {
+                    variableDict[`{{${variableFullPath}}}`] = variableValue
+                    returnVal = returnVal.split(`{{${variableFullPath}}}`).join(variableValue)
+                }
             }
 
             // Resolve values with following case.
@@ -718,10 +989,22 @@ export const getVariableValue = (
         const variablePaths = Object.keys(variableDict)
         variablePaths.sort() // Sort by length of variable path because longer path could possibly contains nested variable
         variablePaths.forEach((path) => {
-            const variableValue = variableDict[path]
+            let variableValue: object | string = variableDict[path]
             // Replace all occurrence
             if (typeof variableValue === 'object') {
-                returnVal = returnVal.split(path).join(JSON.stringify(variableValue).replace(/"/g, '\\"'))
+                // Just get the id of variableValue object if it is agentflow node, to avoid circular JSON error
+                if (Object.prototype.hasOwnProperty.call(variableValue, 'predecessorAgents')) {
+                    const nodeId = variableValue['id']
+                    variableValue = { id: nodeId }
+                }
+
+                const stringifiedValue = JSON.stringify(JSON.stringify(variableValue))
+                if (stringifiedValue.startsWith('"') && stringifiedValue.endsWith('"')) {
+                    // get rid of the double quotes
+                    returnVal = returnVal.split(path).join(stringifiedValue.substring(1, stringifiedValue.length - 1))
+                } else {
+                    returnVal = returnVal.split(path).join(JSON.stringify(variableValue).replace(/"/g, '\\"'))
+                }
             } else {
                 returnVal = returnVal.split(path).join(variableValue)
             }
@@ -738,35 +1021,58 @@ export const getVariableValue = (
  * @param {string} question
  * @returns {INodeData}
  */
-export const resolveVariables = (
+export const resolveVariables = async (
     reactFlowNodeData: INodeData,
     reactFlowNodes: IReactFlowNode[],
     question: string,
-    chatHistory: IMessage[]
-): INodeData => {
+    chatHistory: IMessage[],
+    flowConfig?: ICommonObject,
+    uploadedFilesContent?: string,
+    availableVariables: IVariable[] = [],
+    variableOverrides: ICommonObject[] = []
+): Promise<INodeData> => {
     let flowNodeData = cloneDeep(reactFlowNodeData)
-    const types = 'inputs'
 
-    const getParamValues = (paramsObj: ICommonObject) => {
+    const getParamValues = async (paramsObj: ICommonObject) => {
         for (const key in paramsObj) {
             const paramValue: string = paramsObj[key]
             if (Array.isArray(paramValue)) {
                 const resolvedInstances = []
                 for (const param of paramValue) {
-                    const resolvedInstance = getVariableValue(param, reactFlowNodes, question, chatHistory)
+                    const resolvedInstance = await getVariableValue(
+                        param,
+                        reactFlowNodes,
+                        question,
+                        chatHistory,
+                        undefined,
+                        flowConfig,
+                        uploadedFilesContent,
+                        availableVariables,
+                        variableOverrides
+                    )
                     resolvedInstances.push(resolvedInstance)
                 }
                 paramsObj[key] = resolvedInstances
             } else {
                 const isAcceptVariable = reactFlowNodeData.inputParams.find((param) => param.name === key)?.acceptVariable ?? false
-                const resolvedInstance = getVariableValue(paramValue, reactFlowNodes, question, chatHistory, isAcceptVariable)
+                const resolvedInstance = await getVariableValue(
+                    paramValue,
+                    reactFlowNodes,
+                    question,
+                    chatHistory,
+                    isAcceptVariable,
+                    flowConfig,
+                    uploadedFilesContent,
+                    availableVariables,
+                    variableOverrides
+                )
                 paramsObj[key] = resolvedInstance
             }
         }
     }
 
-    const paramsObj = flowNodeData[types] ?? {}
-    getParamValues(paramsObj)
+    const paramsObj = flowNodeData['inputs'] ?? {}
+    await getParamValues(paramsObj)
 
     return flowNodeData
 }
@@ -775,18 +1081,102 @@ export const resolveVariables = (
  * Loop through each inputs and replace their value with override config values
  * @param {INodeData} flowNodeData
  * @param {ICommonObject} overrideConfig
+ * @param {INodeOverrides} nodeOverrides
+ * @param {IVariableOverride[]} variableOverrides
  * @returns {INodeData}
  */
-export const replaceInputsWithConfig = (flowNodeData: INodeData, overrideConfig: ICommonObject) => {
+export const replaceInputsWithConfig = (
+    flowNodeData: INodeData,
+    overrideConfig: ICommonObject,
+    nodeOverrides: INodeOverrides,
+    variableOverrides: IVariableOverride[]
+) => {
     const types = 'inputs'
+
+    const isParameterEnabled = (nodeType: string, paramName: string): boolean => {
+        if (!nodeOverrides[nodeType]) return false
+        const parameter = nodeOverrides[nodeType].find((param: any) => param.name === paramName)
+        return parameter?.enabled ?? false
+    }
 
     const getParamValues = (inputsObj: ICommonObject) => {
         for (const config in overrideConfig) {
-            // If overrideConfig[key] is object
-            if (overrideConfig[config] && typeof overrideConfig[config] === 'object') {
+            /**
+             * Several conditions:
+             * 1. If config is 'analytics', always allow it
+             * 2. If config is 'vars', check its object and filter out the variables that are not enabled for override
+             * 3. If typeof config's value is an array, check if the parameter is enabled and apply directly
+             * 4. If typeof config's value is an object, check if the node id is in the overrideConfig object and if the parameter (systemMessagePrompt) is enabled
+             * Example:
+             * "systemMessagePrompt": {
+             *  "chatPromptTemplate_0": "You are an assistant"
+             * }
+             * 5. If typeof config's value is a string, check if the parameter is enabled
+             * Example:
+             * "systemMessagePrompt": "You are an assistant"
+             */
+
+            if (config === 'analytics') {
+                // pass
+            } else if (config === 'vars') {
+                if (typeof overrideConfig[config] === 'object') {
+                    const filteredVars: ICommonObject = {}
+
+                    const vars = overrideConfig[config]
+                    for (const variable in vars) {
+                        const override = variableOverrides.find((v) => v.name === variable)
+                        if (!override?.enabled) {
+                            continue // Skip this variable if it's not enabled for override
+                        }
+                        filteredVars[variable] = vars[variable]
+                    }
+                    overrideConfig[config] = filteredVars
+                }
+            } else if (Array.isArray(overrideConfig[config])) {
+                // Handle arrays as direct parameter values
+                if (isParameterEnabled(flowNodeData.label, config)) {
+                    // If existing value is also an array, concatenate; otherwise replace
+                    const existingValue = inputsObj[config]
+                    if (Array.isArray(existingValue)) {
+                        inputsObj[config] = [...new Set([...existingValue, ...overrideConfig[config]])]
+                    } else {
+                        inputsObj[config] = overrideConfig[config]
+                    }
+                }
+                continue
+            } else if (overrideConfig[config] && typeof overrideConfig[config] === 'object') {
                 const nodeIds = Object.keys(overrideConfig[config])
                 if (nodeIds.includes(flowNodeData.id)) {
-                    inputsObj[config] = overrideConfig[config][flowNodeData.id]
+                    // Check if this parameter is enabled
+                    if (isParameterEnabled(flowNodeData.label, config)) {
+                        const existingValue = inputsObj[config]
+                        const overrideValue = overrideConfig[config][flowNodeData.id]
+
+                        // Merge objects instead of completely overriding
+                        if (
+                            typeof existingValue === 'object' &&
+                            typeof overrideValue === 'object' &&
+                            !Array.isArray(existingValue) &&
+                            !Array.isArray(overrideValue) &&
+                            existingValue !== null &&
+                            overrideValue !== null
+                        ) {
+                            inputsObj[config] = Object.assign({}, existingValue, overrideValue)
+                        } else if (typeof existingValue === 'string' && existingValue.startsWith('{') && existingValue.endsWith('}')) {
+                            try {
+                                const parsedExisting = JSON.parse(existingValue)
+                                if (typeof overrideValue === 'object' && !Array.isArray(overrideValue)) {
+                                    inputsObj[config] = Object.assign({}, parsedExisting, overrideValue)
+                                } else {
+                                    inputsObj[config] = overrideValue
+                                }
+                            } catch (e) {
+                                inputsObj[config] = overrideValue
+                            }
+                        } else {
+                            inputsObj[config] = overrideValue
+                        }
+                    }
                     continue
                 } else if (nodeIds.some((nodeId) => nodeId.includes(flowNodeData.name))) {
                     /*
@@ -796,30 +1186,50 @@ export const replaceInputsWithConfig = (flowNodeData: INodeData, overrideConfig:
                      */
                     continue
                 }
+            } else {
+                // Skip if it is an override "files" input, such as pdfFile, txtFile, etc
+                if (typeof overrideConfig[config] === 'string' && overrideConfig[config].includes('FILE-STORAGE::')) {
+                    // pass
+                } else if (!isParameterEnabled(flowNodeData.label, config)) {
+                    // Only proceed if the parameter is enabled
+                    continue
+                }
             }
 
             let paramValue = inputsObj[config]
             const overrideConfigValue = overrideConfig[config]
             if (overrideConfigValue) {
                 if (typeof overrideConfigValue === 'object') {
-                    switch (typeof paramValue) {
-                        case 'string':
-                            if (paramValue.startsWith('{') && paramValue.endsWith('}')) {
-                                try {
-                                    paramValue = Object.assign({}, JSON.parse(paramValue), overrideConfigValue)
-                                    break
-                                } catch (e) {
-                                    // ignore
+                    // Handle arrays specifically - concatenate instead of replace
+                    if (Array.isArray(overrideConfigValue) && Array.isArray(paramValue)) {
+                        paramValue = [...new Set([...paramValue, ...overrideConfigValue])]
+                    } else if (Array.isArray(overrideConfigValue)) {
+                        paramValue = overrideConfigValue
+                    } else {
+                        switch (typeof paramValue) {
+                            case 'string':
+                                if (paramValue.startsWith('{') && paramValue.endsWith('}')) {
+                                    try {
+                                        paramValue = Object.assign({}, JSON.parse(paramValue), overrideConfigValue)
+                                        break
+                                    } catch (e) {
+                                        // ignore
+                                    }
                                 }
-                            }
-                            paramValue = overrideConfigValue
-                            break
-                        case 'object':
-                            paramValue = Object.assign({}, paramValue, overrideConfigValue)
-                            break
-                        default:
-                            paramValue = overrideConfigValue
-                            break
+                                paramValue = overrideConfigValue
+                                break
+                            case 'object':
+                                // Make sure we're not dealing with arrays here
+                                if (!Array.isArray(paramValue)) {
+                                    paramValue = Object.assign({}, paramValue, overrideConfigValue)
+                                } else {
+                                    paramValue = overrideConfigValue
+                                }
+                                break
+                            default:
+                                paramValue = overrideConfigValue
+                                break
+                        }
                     }
                 } else {
                     paramValue = overrideConfigValue
@@ -903,35 +1313,16 @@ export const isSameOverrideConfig = (
 }
 
 /**
- * Map MimeType to InputField
- * @param {string} mimeType
- * @returns {Promise<string>}
+ * @param {string} existingChatId
+ * @param {string} newChatId
+ * @returns {boolean}
  */
-export const mapMimeTypeToInputField = (mimeType: string) => {
-    switch (mimeType) {
-        case 'text/plain':
-            return 'txtFile'
-        case 'application/pdf':
-            return 'pdfFile'
-        case 'application/json':
-            return 'jsonFile'
-        case 'text/csv':
-            return 'csvFile'
-        case 'application/json-lines':
-        case 'application/jsonl':
-        case 'text/jsonl':
-            return 'jsonlinesFile'
-        case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-            return 'docxFile'
-        case 'application/vnd.yaml':
-        case 'application/x-yaml':
-        case 'text/vnd.yaml':
-        case 'text/x-yaml':
-        case 'text/yaml':
-            return 'yamlFile'
-        default:
-            return ''
+export const isSameChatId = (existingChatId?: string, newChatId?: string): boolean => {
+    if (isEqual(existingChatId, newChatId)) {
+        return true
     }
+    if (!existingChatId && !newChatId) return true
+    return false
 }
 
 /**
@@ -945,7 +1336,7 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[], component
 
     for (const flowNode of reactFlowNodes) {
         for (const inputParam of flowNode.data.inputParams) {
-            let obj: IOverrideConfig
+            let obj: IOverrideConfig | undefined
             if (inputParam.type === 'file') {
                 obj = {
                     node: flowNode.data.label,
@@ -986,6 +1377,72 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[], component
                     }
                 }
                 continue
+            } else if (inputParam.type === 'array') {
+                const arrayItem = inputParam.array
+                if (Array.isArray(arrayItem)) {
+                    const arrayItemSchema: Record<string, string> = {}
+                    // Build object schema representing the structure of each array item
+                    for (const item of arrayItem) {
+                        let itemType = item.type
+                        if (itemType === 'options') {
+                            const availableOptions = item.options?.map((option) => option.name).join(', ')
+                            itemType = `(${availableOptions})`
+                        } else if (itemType === 'file') {
+                            itemType = item.fileType ?? item.type
+                        }
+                        arrayItemSchema[item.name] = itemType
+                    }
+                    obj = {
+                        node: flowNode.data.label,
+                        nodeId: flowNode.data.id,
+                        label: inputParam.label,
+                        name: inputParam.name,
+                        type: inputParam.type,
+                        schema: arrayItemSchema
+                    }
+                }
+            } else if (inputParam.loadConfig) {
+                const configData = flowNode?.data?.inputs?.[`${inputParam.name}Config`]
+                if (configData) {
+                    // Parse config data to extract schema
+                    let parsedConfig: any = {}
+                    try {
+                        parsedConfig = typeof configData === 'string' ? JSON.parse(configData) : configData
+                    } catch (e) {
+                        // If parsing fails, treat as empty object
+                        parsedConfig = {}
+                    }
+
+                    // Generate schema from config structure
+                    const configSchema: Record<string, string> = {}
+                    parsedConfig = _removeCredentialId(parsedConfig)
+                    for (const key in parsedConfig) {
+                        if (key === inputParam.name) continue
+                        const value = parsedConfig[key]
+                        let fieldType = 'string' // default type
+
+                        if (typeof value === 'boolean') {
+                            fieldType = 'boolean'
+                        } else if (typeof value === 'number') {
+                            fieldType = 'number'
+                        } else if (Array.isArray(value)) {
+                            fieldType = 'array'
+                        } else if (typeof value === 'object' && value !== null) {
+                            fieldType = 'object'
+                        }
+
+                        configSchema[key] = fieldType
+                    }
+
+                    obj = {
+                        node: flowNode.data.label,
+                        nodeId: flowNode.data.id,
+                        label: `${inputParam.label} Config`,
+                        name: `${inputParam.name}Config`,
+                        type: `json`,
+                        schema: configSchema
+                    }
+                }
             } else {
                 obj = {
                     node: flowNode.data.label,
@@ -995,12 +1452,11 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[], component
                     type: inputParam.type === 'password' ? 'string' : inputParam.type
                 }
             }
-            if (!configs.some((config) => JSON.stringify(config) === JSON.stringify(obj))) {
+            if (obj && !configs.some((config) => JSON.stringify(config) === JSON.stringify(obj))) {
                 configs.push(obj)
             }
         }
     }
-
     return configs
 }
 
@@ -1012,19 +1468,29 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[], component
  * @returns {boolean}
  */
 export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNodeData: INodeData) => {
+    /** Deprecated, add streaming input param to the component instead **/
     const streamAvailableLLMs = {
         'Chat Models': [
             'azureChatOpenAI',
             'chatOpenAI',
             'chatOpenAI_LlamaIndex',
+            'chatOpenAICustom',
             'chatAnthropic',
             'chatAnthropic_LlamaIndex',
             'chatOllama',
+            'chatOllama_LlamaIndex',
             'awsChatBedrock',
             'chatMistralAI',
+            'chatMistral_LlamaIndex',
+            'chatAlibabaTongyi',
             'groqChat',
+            'chatGroq_LlamaIndex',
             'chatCohere',
-            'chatGoogleGenerativeAI'
+            'chatGoogleGenerativeAI',
+            'chatTogetherAI',
+            'chatTogetherAI_LlamaIndex',
+            'chatFireworks',
+            'chatBaiduWenxin'
         ],
         LLMs: ['azureOpenAI', 'openAI', 'ollama']
     }
@@ -1033,9 +1499,18 @@ export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNod
     for (const flowNode of reactFlowNodes) {
         const data = flowNode.data
         if (data.category === 'Chat Models' || data.category === 'LLMs') {
-            isChatOrLLMsExist = true
-            const validLLMs = streamAvailableLLMs[data.category]
-            if (!validLLMs.includes(data.name)) return false
+            if (data.inputs?.streaming === false || data.inputs?.streaming === 'false') {
+                return false
+            }
+            if (data.inputs?.streaming === true || data.inputs?.streaming === 'true') {
+                isChatOrLLMsExist = true // passed, proceed to next check
+            }
+            /** Deprecated, add streaming input param to the component instead **/
+            if (!Object.prototype.hasOwnProperty.call(data.inputs, 'streaming') && !data.inputs?.streaming) {
+                isChatOrLLMsExist = true
+                const validLLMs = streamAvailableLLMs[data.category]
+                if (!validLLMs.includes(data.name)) return false
+            }
         }
     }
 
@@ -1046,26 +1521,8 @@ export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNod
         isValidChainOrAgent = !blacklistChains.includes(endingNodeData.name)
     } else if (endingNodeData.category === 'Agents') {
         // Agent that are available to stream
-        const whitelistAgents = [
-            'openAIFunctionAgent',
-            'mistralAIToolAgent',
-            'csvAgent',
-            'airtableAgent',
-            'conversationalRetrievalAgent',
-            'openAIToolAgent',
-            'toolAgent'
-        ]
+        const whitelistAgents = ['csvAgent', 'airtableAgent', 'toolAgent', 'conversationalRetrievalToolAgent', 'openAIToolAgentLlamaIndex']
         isValidChainOrAgent = whitelistAgents.includes(endingNodeData.name)
-
-        // Anthropic & Groq Function Calling streaming is still not supported - https://docs.anthropic.com/claude/docs/tool-use
-        const model = endingNodeData.inputs?.model
-        if (endingNodeData.name.includes('toolAgent')) {
-            if (typeof model === 'string' && (model.includes('chatAnthropic') || model.includes('groqChat'))) {
-                return false
-            } else if (typeof model === 'object' && 'id' in model && model['id'].includes('chatAnthropic')) {
-                return false
-            }
-        }
 
         // If agent is openAIAssistant, streaming is enabled
         if (endingNodeData.name === 'openAIAssistant') return true
@@ -1088,20 +1545,35 @@ export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNod
 }
 
 /**
- * Generate an encryption key
- * @returns {string}
- */
-export const generateEncryptKey = (): string => {
-    return randomBytes(24).toString('base64')
-}
-
-/**
  * Returns the encryption key
  * @returns {Promise<string>}
  */
 export const getEncryptionKey = async (): Promise<string> => {
     if (process.env.FLOWISE_SECRETKEY_OVERWRITE !== undefined && process.env.FLOWISE_SECRETKEY_OVERWRITE !== '') {
         return process.env.FLOWISE_SECRETKEY_OVERWRITE
+    }
+    if (USE_AWS_SECRETS_MANAGER && secretsManagerClient) {
+        const secretId = process.env.SECRETKEY_AWS_NAME || 'FlowiseEncryptionKey'
+        try {
+            const command = new GetSecretValueCommand({ SecretId: secretId })
+            const response = await secretsManagerClient.send(command)
+
+            if (response.SecretString) {
+                return response.SecretString
+            }
+        } catch (error: any) {
+            if (error.name === 'ResourceNotFoundException') {
+                // Secret doesn't exist, create it
+                const newKey = generateEncryptKey()
+                const createCommand = new CreateSecretCommand({
+                    Name: secretId,
+                    SecretString: newKey
+                })
+                await secretsManagerClient.send(createCommand)
+                return newKey
+            }
+            throw error
+        }
     }
     try {
         return await fs.promises.readFile(getEncryptionKeyPath(), 'utf8')
@@ -1137,20 +1609,55 @@ export const decryptCredentialData = async (
     componentCredentialName?: string,
     componentCredentials?: IComponentCredentials
 ): Promise<ICredentialDataDecrypted> => {
-    const encryptKey = await getEncryptionKey()
-    const decryptedData = AES.decrypt(encryptedData, encryptKey)
-    const decryptedDataStr = decryptedData.toString(enc.Utf8)
+    let decryptedDataStr: string
+
+    if (USE_AWS_SECRETS_MANAGER && secretsManagerClient) {
+        try {
+            if (encryptedData.startsWith('FlowiseCredential_')) {
+                const command = new GetSecretValueCommand({ SecretId: encryptedData })
+                const response = await secretsManagerClient.send(command)
+
+                if (response.SecretString) {
+                    const secretObj = JSON.parse(response.SecretString)
+                    decryptedDataStr = JSON.stringify(secretObj)
+                } else {
+                    throw new Error('Failed to retrieve secret value.')
+                }
+            } else {
+                const encryptKey = await getEncryptionKey()
+                const decryptedData = AES.decrypt(encryptedData, encryptKey)
+                decryptedDataStr = decryptedData.toString(enc.Utf8)
+            }
+        } catch (error) {
+            console.error(error)
+            throw new Error('Failed to decrypt credential data.')
+        }
+    } else {
+        // Fallback to existing code
+        const encryptKey = await getEncryptionKey()
+        const decryptedData = AES.decrypt(encryptedData, encryptKey)
+        decryptedDataStr = decryptedData.toString(enc.Utf8)
+    }
+
     if (!decryptedDataStr) return {}
     try {
         if (componentCredentialName && componentCredentials) {
-            const plainDataObj = JSON.parse(decryptedData.toString(enc.Utf8))
+            const plainDataObj = JSON.parse(decryptedDataStr)
             return redactCredentialWithPasswordType(componentCredentialName, plainDataObj, componentCredentials)
         }
-        return JSON.parse(decryptedData.toString(enc.Utf8))
+        return JSON.parse(decryptedDataStr)
     } catch (e) {
         console.error(e)
         return {}
     }
+}
+
+/**
+ * Generate an encryption key
+ * @returns {string}
+ */
+export const generateEncryptKey = (): string => {
+    return randomBytes(24).toString('base64')
 }
 
 /**
@@ -1171,6 +1678,10 @@ export const transformToCredentialEntity = async (body: ICredentialReqBody): Pro
 
     const newCredential = new Credential()
     Object.assign(newCredential, credentialBody)
+
+    if (body.workspaceId) {
+        newCredential.workspaceId = body.workspaceId
+    }
 
     return newCredential
 }
@@ -1257,7 +1768,8 @@ export const getSessionChatHistory = async (
     componentNodes: IComponentNodes,
     appDataSource: DataSource,
     databaseEntities: IDatabaseEntity,
-    logger: any
+    logger: any,
+    prependMessages?: IMessage[]
 ): Promise<IMessage[]> => {
     const nodeInstanceFilePath = componentNodes[memoryNode.data.name].filePath as string
     const nodeModule = await import(nodeInstanceFilePath)
@@ -1275,7 +1787,7 @@ export const getSessionChatHistory = async (
         logger
     })
 
-    return (await initializedInstance.getChatMessages(sessionId)) as IMessage[]
+    return (await initializedInstance.getChatMessages(sessionId, undefined, prependMessages)) as IMessage[]
 }
 
 /**
@@ -1339,21 +1851,6 @@ export const getTelemetryFlowObj = (nodes: IReactFlowNode[], edges: IReactFlowEd
 }
 
 /**
- * Get user settings file
- * TODO: move env variables to settings json file, easier configuration
- */
-export const getUserSettingsFilePath = () => {
-    if (process.env.SECRETKEY_PATH) return path.join(process.env.SECRETKEY_PATH, 'settings.json')
-    const checkPaths = [path.join(getUserHome(), '.flowise', 'settings.json')]
-    for (const checkPath of checkPaths) {
-        if (fs.existsSync(checkPath)) {
-            return checkPath
-        }
-    }
-    return ''
-}
-
-/**
  * Get app current version
  */
 export const getAppVersion = async () => {
@@ -1382,4 +1879,190 @@ export const getAppVersion = async () => {
     } catch (error) {
         return ''
     }
+}
+
+export const convertToValidFilename = (word: string) => {
+    return word
+        .replace(/[/|\\:*?"<>]/g, ' ')
+        .replace(' ', '')
+        .toLowerCase()
+}
+
+export const aMonthAgo = () => {
+    const date = new Date()
+    date.setMonth(new Date().getMonth() - 1)
+    return date
+}
+
+export const getAPIOverrideConfig = (chatflow: IChatFlow) => {
+    try {
+        const apiConfig = chatflow.apiConfig ? JSON.parse(chatflow.apiConfig) : {}
+        const nodeOverrides: INodeOverrides =
+            apiConfig.overrideConfig && apiConfig.overrideConfig.nodes ? apiConfig.overrideConfig.nodes : {}
+        const variableOverrides: IVariableOverride[] =
+            apiConfig.overrideConfig && apiConfig.overrideConfig.variables ? apiConfig.overrideConfig.variables : []
+        const apiOverrideStatus: boolean =
+            apiConfig.overrideConfig && apiConfig.overrideConfig.status ? apiConfig.overrideConfig.status : false
+
+        return { nodeOverrides, variableOverrides, apiOverrideStatus }
+    } catch (error) {
+        return { nodeOverrides: {}, variableOverrides: [], apiOverrideStatus: false }
+    }
+}
+
+export const getUploadPath = (): string => {
+    return process.env.BLOB_STORAGE_PATH
+        ? path.join(process.env.BLOB_STORAGE_PATH, 'uploads')
+        : path.join(getUserHome(), '.flowise', 'uploads')
+}
+
+export function generateId() {
+    return uuidv4()
+}
+
+export const getMulterStorage = () => {
+    const storageType = process.env.STORAGE_TYPE ? process.env.STORAGE_TYPE : 'local'
+
+    if (storageType === 's3') {
+        const s3Client = getS3Config().s3Client
+        const Bucket = getS3Config().Bucket
+
+        const upload = multer({
+            storage: multerS3({
+                s3: s3Client,
+                bucket: Bucket,
+                metadata: function (req, file, cb) {
+                    cb(null, { fieldName: file.fieldname, originalName: file.originalname })
+                },
+                key: function (req, file, cb) {
+                    cb(null, `${generateId()}`)
+                }
+            })
+        })
+        return upload
+    } else if (storageType === 'gcs') {
+        return multer({
+            storage: new MulterGoogleCloudStorage({
+                projectId: process.env.GOOGLE_CLOUD_STORAGE_PROJ_ID,
+                bucket: process.env.GOOGLE_CLOUD_STORAGE_BUCKET_NAME,
+                keyFilename: process.env.GOOGLE_CLOUD_STORAGE_CREDENTIAL,
+                uniformBucketLevelAccess: Boolean(process.env.GOOGLE_CLOUD_UNIFORM_BUCKET_ACCESS) ?? true,
+                destination: `uploads/${generateId()}`
+            })
+        })
+    } else {
+        return multer({ dest: getUploadPath() })
+    }
+}
+
+/**
+ * Calculate depth of each node from starting nodes
+ * @param {INodeDirectedGraph} graph
+ * @param {string[]} startingNodeIds
+ * @returns {Record<string, number>} Map of nodeId to its depth
+ */
+export const calculateNodesDepth = (graph: INodeDirectedGraph, startingNodeIds: string[]): Record<string, number> => {
+    const depths: Record<string, number> = {}
+    const visited = new Set<string>()
+
+    // Initialize all nodes with depth -1 (unvisited)
+    for (const nodeId in graph) {
+        depths[nodeId] = -1
+    }
+
+    // BFS queue with [nodeId, depth]
+    const queue: [string, number][] = startingNodeIds.map((id) => [id, 0])
+
+    // Set starting nodes depth to 0
+    startingNodeIds.forEach((id) => {
+        depths[id] = 0
+    })
+
+    while (queue.length > 0) {
+        const [currentNode, currentDepth] = queue.shift()!
+
+        if (visited.has(currentNode)) continue
+        visited.add(currentNode)
+
+        // Process all neighbors
+        for (const neighbor of graph[currentNode]) {
+            if (!visited.has(neighbor)) {
+                // Update depth if unvisited or found shorter path
+                if (depths[neighbor] === -1 || depths[neighbor] > currentDepth + 1) {
+                    depths[neighbor] = currentDepth + 1
+                }
+                queue.push([neighbor, currentDepth + 1])
+            }
+        }
+    }
+
+    return depths
+}
+
+/**
+ * Helper function to get all nodes in a path starting from a node
+ * @param {INodeDirectedGraph} graph
+ * @param {string} startNode
+ * @returns {string[]}
+ */
+export const getAllNodesInPath = (startNode: string, graph: INodeDirectedGraph): string[] => {
+    const nodes = new Set<string>()
+    const queue = [startNode]
+
+    while (queue.length > 0) {
+        const current = queue.shift()!
+        if (nodes.has(current)) continue
+
+        nodes.add(current)
+        if (graph[current]) {
+            queue.push(...graph[current])
+        }
+    }
+
+    return Array.from(nodes)
+}
+
+export const _removeCredentialId = (obj: any): any => {
+    if (!obj || typeof obj !== 'object') return obj
+
+    if (Array.isArray(obj)) {
+        return obj.map((item) => _removeCredentialId(item))
+    }
+
+    const newObj: Record<string, any> = {}
+    for (const [key, value] of Object.entries(obj)) {
+        if (key === 'FLOWISE_CREDENTIAL_ID') continue
+        newObj[key] = _removeCredentialId(value)
+    }
+    return newObj
+}
+
+/**
+ * Validates that history items follow the expected schema
+ * @param {any[]} history - Array of history items to validate
+ * @returns {boolean} - True if all items are valid, false otherwise
+ */
+export const validateHistorySchema = (history: any[]): boolean => {
+    if (!Array.isArray(history)) {
+        return false
+    }
+
+    return history.every((item) => {
+        // Check if item is an object
+        if (typeof item !== 'object' || item === null) {
+            return false
+        }
+
+        // Check if role exists and is valid
+        if (typeof item.role !== 'string' || !['apiMessage', 'userMessage'].includes(item.role)) {
+            return false
+        }
+
+        // Check if content exists and is a string
+        if (typeof item.content !== 'string') {
+            return false
+        }
+
+        return true
+    })
 }

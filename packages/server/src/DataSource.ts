@@ -6,7 +6,9 @@ import { getUserHome } from './utils'
 import { entities } from './database/entities'
 import { sqliteMigrations } from './database/migrations/sqlite'
 import { mysqlMigrations } from './database/migrations/mysql'
+import { mariadbMigrations } from './database/migrations/mariadb'
 import { postgresMigrations } from './database/migrations/postgres'
+import logger from './utils/logger'
 
 let appDataSource: DataSource
 
@@ -44,6 +46,22 @@ export const init = async (): Promise<void> => {
                 ssl: getDatabaseSSLFromEnv()
             })
             break
+        case 'mariadb':
+            appDataSource = new DataSource({
+                type: 'mariadb',
+                host: process.env.DATABASE_HOST,
+                port: parseInt(process.env.DATABASE_PORT || '3306'),
+                username: process.env.DATABASE_USER,
+                password: process.env.DATABASE_PASSWORD,
+                database: process.env.DATABASE_NAME,
+                charset: 'utf8mb4',
+                synchronize: false,
+                migrationsRun: false,
+                entities: Object.values(entities),
+                migrations: mariadbMigrations,
+                ssl: getDatabaseSSLFromEnv()
+            })
+            break
         case 'postgres':
             appDataSource = new DataSource({
                 type: 'postgres',
@@ -56,7 +74,17 @@ export const init = async (): Promise<void> => {
                 synchronize: false,
                 migrationsRun: false,
                 entities: Object.values(entities),
-                migrations: postgresMigrations
+                migrations: postgresMigrations,
+                extra: {
+                    idleTimeoutMillis: 120000
+                },
+                logging: ['error', 'warn', 'info', 'log'],
+                logger: 'advanced-console',
+                logNotifications: true,
+                poolErrorHandler: (err) => {
+                    logger.error(`Database pool error: ${JSON.stringify(err)}`)
+                },
+                applicationName: 'Flowise'
             })
             break
         default:
@@ -80,7 +108,7 @@ export function getDataSource(): DataSource {
     return appDataSource
 }
 
-const getDatabaseSSLFromEnv = () => {
+export const getDatabaseSSLFromEnv = () => {
     if (process.env.DATABASE_SSL_KEY_BASE64) {
         return {
             rejectUnauthorized: false,

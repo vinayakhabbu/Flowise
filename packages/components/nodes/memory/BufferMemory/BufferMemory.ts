@@ -61,6 +61,7 @@ class BufferMemory_Memory implements INode {
         const appDataSource = options.appDataSource as DataSource
         const databaseEntities = options.databaseEntities as IDatabaseEntity
         const chatflowid = options.chatflowid as string
+        const orgId = options.orgId as string
 
         return new BufferMemoryExtended({
             returnMessages: true,
@@ -68,7 +69,8 @@ class BufferMemory_Memory implements INode {
             sessionId,
             appDataSource,
             databaseEntities,
-            chatflowid
+            chatflowid,
+            orgId
         })
     }
 }
@@ -78,12 +80,14 @@ interface BufferMemoryExtendedInput {
     appDataSource: DataSource
     databaseEntities: IDatabaseEntity
     chatflowid: string
+    orgId: string
 }
 
 class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
     appDataSource: DataSource
     databaseEntities: IDatabaseEntity
     chatflowid: string
+    orgId: string
     sessionId = ''
 
     constructor(fields: BufferMemoryInput & BufferMemoryExtendedInput) {
@@ -92,9 +96,14 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
         this.appDataSource = fields.appDataSource
         this.databaseEntities = fields.databaseEntities
         this.chatflowid = fields.chatflowid
+        this.orgId = fields.orgId
     }
 
-    async getChatMessages(overrideSessionId = '', returnBaseMessages = false): Promise<IMessage[] | BaseMessage[]> {
+    async getChatMessages(
+        overrideSessionId = '',
+        returnBaseMessages = false,
+        prependMessages?: IMessage[]
+    ): Promise<IMessage[] | BaseMessage[]> {
         const id = overrideSessionId ? overrideSessionId : this.sessionId
         if (!id) return []
 
@@ -108,8 +117,12 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
             }
         })
 
+        if (prependMessages?.length) {
+            chatMessage.unshift(...prependMessages)
+        }
+
         if (returnBaseMessages) {
-            return mapChatMessageToBaseMessage(chatMessage)
+            return await mapChatMessageToBaseMessage(chatMessage, this.orgId)
         }
 
         let returnIMessages: IMessage[] = []
@@ -119,6 +132,7 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
                 type: m.role
             })
         }
+
         return returnIMessages
     }
 

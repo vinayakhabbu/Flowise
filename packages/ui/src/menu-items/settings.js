@@ -6,8 +6,10 @@ import {
     IconCopy,
     IconMessage,
     IconDatabaseExport,
-    IconAdjustmentsHorizontal
-} from '@tabler/icons'
+    IconAdjustmentsHorizontal,
+    IconUsers,
+    IconTemplate
+} from '@tabler/icons-react'
 
 // constant
 const icons = {
@@ -17,7 +19,9 @@ const icons = {
     IconCopy,
     IconMessage,
     IconDatabaseExport,
-    IconAdjustmentsHorizontal
+    IconAdjustmentsHorizontal,
+    IconUsers,
+    IconTemplate
 }
 
 // ==============================|| SETTINGS MENU ITEMS ||============================== //
@@ -35,6 +39,13 @@ const settings = {
             icon: icons.IconMessage
         },
         {
+            id: 'viewLeads',
+            title: 'View Leads',
+            type: 'item',
+            url: '',
+            icon: icons.IconUsers
+        },
+        {
             id: 'viewUpsertHistory',
             title: 'Upsert History',
             type: 'item',
@@ -46,35 +57,48 @@ const settings = {
             title: 'Configuration',
             type: 'item',
             url: '',
+            permission: 'chatflows:config',
             icon: icons.IconAdjustmentsHorizontal
+        },
+        {
+            id: 'saveAsTemplate',
+            title: 'Save As Template',
+            type: 'item',
+            url: '',
+            icon: icons.IconTemplate,
+            permission: 'templates:flowexport'
         },
         {
             id: 'duplicateChatflow',
             title: 'Duplicate Chatflow',
             type: 'item',
             url: '',
-            icon: icons.IconCopy
+            icon: icons.IconCopy,
+            permission: 'chatflows:duplicate'
         },
         {
             id: 'loadChatflow',
             title: 'Load Chatflow',
             type: 'item',
             url: '',
-            icon: icons.IconFileUpload
+            icon: icons.IconFileUpload,
+            permission: 'chatflows:import'
         },
         {
             id: 'exportChatflow',
             title: 'Export Chatflow',
             type: 'item',
             url: '',
-            icon: icons.IconFileExport
+            icon: icons.IconFileExport,
+            permission: 'chatflows:export'
         },
         {
             id: 'deleteChatflow',
             title: 'Delete Chatflow',
             type: 'item',
             url: '',
-            icon: icons.IconTrash
+            icon: icons.IconTrash,
+            permission: 'chatflows:delete'
         }
     ]
 }
